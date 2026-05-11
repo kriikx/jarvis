@@ -576,7 +576,7 @@ a small fallback chain before giving up rather than confabulating:
 3. **Honest failure** — if every provider fails, the reply tells you the
    search was blocked rather than making something up.
 
-The whole chain is bounded by a ~20s wall-clock deadline so a stalled
+The whole chain is bounded by a 20s wall-clock deadline so a stalled
 provider can't run out the voice-assistant latency budget.
 
 </details>
