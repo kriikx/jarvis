@@ -6,7 +6,7 @@ This specification documents only the reply flow that begins when a valid user q
 - Components:
   - Reply Engine (`src/jarvis/reply/engine.py`): Orchestrates conversation-memory enrichment, tool-use protocol, messages loop, output, and memory update.
   - System Prompt (`src/jarvis/system_prompt.py`): Provides a unified `SYSTEM_PROMPT` with adaptive guidance for all topics. Declares the assistant's persona — a British butler named Jarvis with dry wit and light, good-natured sarcasm — with explicit behavioural rules (answer-first/quip-second, at most one quip, skip the quip for serious topics, no butler clichés, sarcasm never aimed at the user). The rules are phrased concretely rather than as tone adjectives so small models can follow them. Persona behaviour is not currently covered by an eval; add one if the tone regresses or the rules evolve.
-  - LLM Gateway (`src/jarvis/llm.py`): `chat_with_messages` sends the messages array and returns raw JSON; `extract_text_from_response` normalizes content across providers.
+  - LLM Gateway (`src/jarvis/llm/`): pluggable backend abstraction (`LLMBackend` ABC + `OllamaBackend` impl, factory at `get_llm_backend(settings)`). The reply engine uses the function-style helper `chat_with_messages` (sends the messages array and returns raw JSON) and `extract_text_from_response` (normalises content across providers); both dispatch to the same backend. See `src/jarvis/llm/llm.spec.md`.
   - Conversation Memory (`src/jarvis/memory/conversation.py`): Supplies recent dialogue messages and keyword/time-bounded recall.
   - Enrichment LLM (`src/jarvis/reply/enrichment.py`): Extracts search params (keywords and optional time bounds) from the current query to drive conversation recall.
 
@@ -50,7 +50,7 @@ Design principles enforced by the engine:
 4. Conversation Memory Enrichment (gated)
    - Runs only when the planner emitted a `searchMemory` directive OR the planner returned an empty plan (fail-open). Skipped otherwise, along with the keyword-extractor LLM call, the diary and graph queries, and the memory-digest LLM call.
    - Extract search parameters via `extract_search_params_for_memory(query, base_url, router_model, ..., context_hint=...)`.
-     - Runs on the tool-router model chain (`resolve_tool_router_model(cfg)` → `tool_router_model → intent_judge_model → ollama_chat_model`), not the big chat model. The extractor is a small classification-shaped task and rides the already-warm router/judge model instead of paging in the chat weights.
+     - Runs on the fast tier (`resolve_model(cfg, Tier.FAST)`), not the big chat model. The extractor is a small classification-shaped task and rides the already-warm fast model instead of paging in the chat weights.
      - The planner's `topic` hint (when present) is appended to the query the extractor sees, so keyword selection anchors on what the planner actually wanted to look up.
      - Output fields: `keywords: List[str]`, optional `from`, optional `to`, optional `questions: List[str]`.
      - `context_hint` carries a compact summary of what is already live in the assistant's context (current time, location, short-term dialogue). The extractor uses it to skip implicit personal questions whose answers are already visible — those facts do not need to be pulled from long-term memory.
@@ -237,14 +237,16 @@ The system injects fresh contextual information before each LLM call in the agen
 
 **Context Format:**
 ```
-[Context: Monday, September 15, 2025 at 17:53 UTC, Location: San Francisco, CA, United States (America/Los_Angeles)]
-
 {original system prompt content}
+
+[Context: Monday, September 15, 2025 at 17:53 UTC, Location: San Francisco, CA, United States (America/Los_Angeles)]
 ```
 
 **Implementation Details:**
-- Context is prepended to the FIRST system message before every turn of the 8-turn agentic loop
+- Context is appended to the END of the dynamic region of the FIRST system message before every turn of the 8-turn agentic loop (in text-tools mode, immediately before the tool-call syntax guidance so the instruction block stays final for small models)
 - Note: Separate context messages are NOT used because adding system messages after the conversation starts breaks native tool calling in models like Llama 3.2
+- KV-cache discipline: the context string is computed **once per reply** (memoised) and the block sits at the tail of the system message, never the head. Every in-loop LLM call of one reply therefore sends a byte-identical system message, and the persona / model-components / warm-profile head stays identical across replies — the server's KV / prefix cache can reuse the whole prompt head instead of recomputing it
+- The `_is_context_injected` marker (stripped before the wire) makes the injection idempotent; a rebuilt system message (native→text-tool fallback, toolSearchTool allow-list widening) loses the marker and gets the block re-appended
 - Time is provided in UTC format with day name for clarity
 - Location is derived from configured IP address or auto-detection (if enabled)
 - Falls back gracefully to "Location: Unknown" if location services unavailable
@@ -253,7 +255,7 @@ The system injects fresh contextual information before each LLM call in the agen
 **Benefits:**
 - Time-aware scheduling and deadline suggestions
 - Location-relevant recommendations and services
-- Fresh context updates throughout multi-turn conversations
+- Fresh context updates throughout multi-turn conversations (refreshed per reply, not per loop call — a reply is short-lived while KV reuse is worth thousands of tokens of recompute per loop iteration)
 - No accumulation of stale temporal information
 
 #### Agentic Flow Examples
@@ -285,7 +287,7 @@ Turn 4: LLM → {content: "Here's a comprehensive comparison of the iPhone 15 mo
 - Timeouts (seconds):
 
   - `llm_tools_timeout_sec` (enrichment extraction)
-  - `llm_embed_timeout_sec` (vector search)
+  - `llm_embedding_timeout_sec` (vector search)
   - `llm_chat_timeout_sec` (messages loop turn)
 - Memory enrichment:
   - `memory_enrichment_max_results` limits recalled snippets.
@@ -311,7 +313,7 @@ The reply engine automatically detects model size and adjusts prompts accordingl
 ```python
 from jarvis.reply.prompts import detect_model_size, get_system_prompts
 
-model_size = detect_model_size(cfg.ollama_chat_model)  # SMALL or LARGE
+model_size = detect_model_size(cfg.llm_chat_model)  # SMALL or LARGE
 prompts = get_system_prompts(model_size)
 ```
 

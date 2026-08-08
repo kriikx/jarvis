@@ -373,37 +373,34 @@ class TestRecordingStateMachine:
         # Only one of the two calls should have reached the stream.
         assert stream_mock.close.call_count == 1
 
-    def test_max_duration_callback_still_stops_recording(self):
-        """Hitting the 60s cap must still close the stream and fire the end
-        callback, even though the new teardown path runs off-thread.
-
-        ``_audio_callback`` spawns a daemon thread that calls
-        ``_stop_recording()``; that then dispatches ``_finalise_and_transcribe``
-        which closes the stream and eventually invokes ``_on_dictation_end``
-        (via ``_transcribe_and_paste``'s finally).
-        """
+    def test_callback_accumulates_indefinitely_without_cap(self):
+        """Without a max duration cap, the audio callback must continue
+        accumulating frames regardless of duration."""
         import numpy as np
         end_called = threading.Event()
         engine = _make_engine(
-            on_dictation_end=lambda: end_called.set(),
-            whisper_model_ref=lambda: None,  # short-circuits transcribe
+            on_dictation_end=end_called.set,
+            whisper_model_ref=lambda: None,
             whisper_backend_ref=lambda: "faster-whisper",
         )
         stream_mock = MagicMock()
         engine._recording = True
         engine._stream = stream_mock
-        # Pre-fill up to the limit so one more frame triggers the cap.
-        engine._max_frames = 100
-        engine._audio_frames = [np.zeros(100, dtype=np.float32)]
+        engine._audio_frames = []
 
         with patch("src.jarvis.dictation.dictation_engine._play_beep"):
-            indata = np.random.randn(1600, 1).astype(np.float32)
-            engine._audio_callback(indata, 1600, None, None)
-            # _stop_recording runs in a daemon thread; wait for close().
-            assert end_called.wait(timeout=5.0), "on_dictation_end never fired"
+            # Send many frames — well past a hypothetical 60s cap
+            for _ in range(100):
+                indata = np.random.randn(1600, 1).astype(np.float32)
+                engine._audio_callback(indata, 1600, None, None)
 
-        assert stream_mock.close.called, "stream.close() never ran"
-        assert engine._recording is False
+        # All frames accumulated; no stop was triggered
+        assert len(engine._audio_frames) == 100
+        assert engine._recording is True
+        assert not end_called.is_set()
+
+        # Cleanup
+        engine._stop_recording(discard=True)
 
     def test_finalise_fires_on_dictation_end_when_beep_raises(self):
         """A failure in ``_play_beep`` must not strand the listener paused.
@@ -610,19 +607,19 @@ class TestAudioCallback:
         engine._audio_callback(indata, 1600, None, None)
         assert len(engine._audio_frames) == 0
 
-    def test_callback_respects_max_duration(self):
+    def test_callback_accumulates_without_cap(self):
+        """Audio callback must accumulate frames without triggering stop."""
         import numpy as np
         engine = _make_engine()
         engine._recording = True
-        # Pre-fill near the max
-        engine._max_frames = 100
         engine._audio_frames = [np.zeros(100, dtype=np.float32)]
 
         indata = np.random.randn(1600, 1).astype(np.float32)
-        with patch.object(engine, "_stop_recording"):
+        with patch.object(engine, "_stop_recording") as mock_stop:
             engine._audio_callback(indata, 1600, None, None)
-            # Should not accumulate more frames
-            assert len(engine._audio_frames) == 1
+            # Frame should be appended; _stop_recording must NOT be called
+            assert len(engine._audio_frames) == 2
+            mock_stop.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +687,81 @@ class TestTranscribeAndPaste:
         frames = [np.zeros(8000, dtype=np.float32)]
         engine._transcribe_and_paste(frames)
         mock_paste.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Paste-activation suppression
+# ---------------------------------------------------------------------------
+
+class TestPasteActivationSuppression:
+    """Tests that synthetic key events during paste don't restart recording."""
+
+    def _make_keys(self):
+        """Get real pynput key objects for ctrl, shift, and d."""
+        from pynput import keyboard
+        import importlib
+        import src.jarvis.dictation.dictation_engine as de
+        importlib.reload(de)  # ensures _MODIFIER_MAP is populated
+        return (
+            keyboard.Key.ctrl_l,
+            keyboard.Key.shift,
+            keyboard.KeyCode.from_char("d"),
+        )
+
+    def test_paste_in_progress_suppresses_restart(self):
+        """Synthetic key events during paste must not trigger new recording."""
+        from pynput import keyboard as pynput_kb
+        from src.jarvis.dictation.dictation_engine import DictationEngine
+
+        engine = _make_engine(hotkey="ctrl+shift+d")
+        ctrl, shift, d = self._make_keys()
+
+        # Simulate post-stop state — not recording, paste in progress
+        engine._recording = False
+        engine._paste_in_progress = True
+        engine._pressed_modifiers.clear()
+
+        with patch.object(engine, "_start_recording") as mock_start:
+            # Paste thread first presses modifier keys (Ctrl, then Shift)
+            engine._on_key_press(ctrl)
+            engine._on_key_press(shift)
+            # Paste thread then taps 'd' (Ctrl+V)
+            engine._on_key_press(d)
+            # Must NOT start a new recording during paste
+            mock_start.assert_not_called()
+
+        # Now simulate paste completed — clear flag and release synthetic keys
+        engine._paste_in_progress = False
+        engine._on_key_release(d)
+        engine._on_key_release(shift)
+
+        # User is still holding the physical keys — simulate key repeat events
+        # that the OS might generate for held modifiers
+        engine._on_key_press(ctrl)
+        engine._on_key_press(shift)
+
+        with patch.object(engine, "_start_recording") as mock_start:
+            engine._on_key_press(d)
+            mock_start.assert_called_once()
+
+        engine.stop()
+
+    def test_paste_in_progress_does_not_block_normal_release_stop(self):
+        """Normal release of hotkey must still stop recording during paste."""
+        engine = _make_engine(hotkey="ctrl+shift+d")
+        ctrl, shift, d = self._make_keys()
+
+        # Simulate recording in progress
+        engine._recording = True
+        engine._paste_in_progress = False
+        engine._pressed_modifiers = {ctrl, shift}
+
+        with patch.object(engine, "_stop_recording") as mock_stop:
+            # User releases a modifier
+            engine._on_key_release(ctrl)
+            mock_stop.assert_called_once()
+
+        engine.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -972,3 +1044,34 @@ class TestClipboardWindowsCtypes:
             assert result == test_text
         finally:
             user32.CloseClipboard()
+
+
+class TestLlmCleanDictation:
+    """``_llm_clean_dictation`` is a rewrite task (not a classification):
+    its generation cap must scale with the dictated text so long dictations
+    are never silently truncated."""
+
+    def test_cap_scales_with_text_length(self):
+        from src.jarvis.dictation.dictation_engine import _llm_clean_dictation
+
+        caps = {}
+
+        def fake_direct(model, system, user, timeout_sec=5.0, thinking=False, **kwargs):
+            caps["max_tokens"] = kwargs.get("max_tokens")
+            return "cleaned text"
+
+        fake_backend = MagicMock()
+        fake_backend.direct.side_effect = fake_direct
+
+        with patch("src.jarvis.llm.get_llm_backend", return_value=fake_backend):
+            _llm_clean_dictation("short", MagicMock())
+            short_cap = caps["max_tokens"]
+
+            long_text = "word " * 1000  # ~5000 chars — long dictation
+            _llm_clean_dictation(long_text, MagicMock())
+            long_cap = caps["max_tokens"]
+
+        # Short utterances hit the floor; long dictations get a proportional cap
+        assert short_cap == 64
+        assert long_cap > short_cap
+        assert long_cap >= len(long_text) // 2

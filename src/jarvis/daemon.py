@@ -252,18 +252,16 @@ def _check_and_update_diary(
             # Only use token handler if we have callbacks or IPC enabled
             on_token = on_token_handler if (use_callbacks or use_ipc) else None
 
-            # Graph best-child picker is a one-digit classification — reuse the
-            # tool-router model chain so placement runs on a small model instead
-            # of paging in the big chat model for every fact.
-            from .reply.engine import resolve_tool_router_model
-            graph_picker_model = resolve_tool_router_model(cfg)
+            # Graph best-child picker is a one-digit classification — a fast-tier
+            # job, so placement runs on the small model instead of paging in the
+            # big chat model for every fact.
+            from .llm import resolve_model, Tier
+            graph_picker_model = resolve_model(cfg, Tier.FAST)
 
             summary_id = update_diary_from_dialogue_memory(
                 db=db,
                 dialogue_memory=_global_dialogue_memory,
-                ollama_base_url=cfg.ollama_base_url,
-                ollama_chat_model=cfg.ollama_chat_model,
-                ollama_embed_model=cfg.ollama_embed_model,
+                cfg=cfg,
                 source_app=source_app,
                 voice_debug=cfg.voice_debug,
                 timeout_sec=effective_timeout,
@@ -301,8 +299,14 @@ def _check_and_update_diary(
         _notify("complete", False)
 
 
-def main() -> None:
-    """Main daemon entry point."""
+def main(smoke_test: bool = False) -> None:
+    """Main daemon entry point.
+
+    Args:
+        smoke_test: If True, initialise all components, print a success
+            marker, and return without entering the main event loop.
+            Used by CI smoke tests to verify the build is not broken.
+    """
     global _global_dialogue_memory, _global_stop_requested, _global_tts_engine, _global_dictation_engine
     global _warm_profile_graph_listener
 
@@ -316,7 +320,7 @@ def main() -> None:
 
     debug_log("daemon started", "jarvis")
     print("✓ Daemon started", flush=True)
-    print(f"🧠 Using chat model: {cfg.ollama_chat_model}", flush=True)
+    print(f"🧠 Using chat model: {cfg.llm_chat_model}", flush=True)
     print(f"🎤 Using whisper model: {cfg.whisper_model}", flush=True)
 
     # MCP preflight: discover and cache external MCP tools
@@ -527,8 +531,8 @@ def main() -> None:
                 voice_device=getattr(cfg, "voice_device", None),
                 filler_removal=getattr(cfg, "dictation_filler_removal", False),
                 custom_dictionary=getattr(cfg, "dictation_custom_dictionary", []),
-                ollama_base_url=getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434"),
-                ollama_model=cfg.ollama_chat_model,
+                cfg=cfg,
+                chat_model=cfg.llm_chat_model,
                 thinking=getattr(cfg, "dictation_thinking_enabled", False),
             )
             dictation.start()
@@ -542,6 +546,54 @@ def main() -> None:
             print(f"  ⚠ Dictation not available: {e}", flush=True)
     else:
         print("🎙️ Dictation disabled", flush=True)
+
+    if smoke_test:
+        print("SMOKE_TEST_INIT_OK", flush=True)
+        debug_log("smoke test: all components initialised successfully", "jarvis")
+
+        # Clean shutdown: stop engines, close database, tear down MCP runtime.
+        # The caller is responsible for printing SMOKE_TEST_PASSED / FAILED.
+        if dictation is not None:
+            try:
+                dictation.stop()
+            except Exception:
+                pass
+
+        if voice_thread is not None:
+            try:
+                voice_thread.stop()
+                voice_thread.join(timeout=2.0)
+            except Exception:
+                pass
+
+        if tts is not None:
+            try:
+                tts.stop()
+            except Exception:
+                pass
+
+        try:
+            from .tools.external.mcp_runtime import shutdown_runtime
+            shutdown_runtime()
+        except Exception:
+            pass
+
+        db.close()
+
+        if _warm_profile_graph_listener is not None:
+            try:
+                from .memory.graph import unregister_graph_mutation_listener
+                unregister_graph_mutation_listener(_warm_profile_graph_listener)
+            except Exception:
+                pass
+            _warm_profile_graph_listener = None
+
+        # Reset module-level globals so in-process re-entry is clean.
+        _global_dialogue_memory = None
+        _global_tts_engine = None
+        _global_dictation_engine = None
+
+        return
 
     # Periodic diary update checking
     last_diary_check = time.time()
@@ -660,4 +712,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    smoke_test = "--smoke-test" in set(_sys.argv[1:])
+    main(smoke_test=smoke_test)

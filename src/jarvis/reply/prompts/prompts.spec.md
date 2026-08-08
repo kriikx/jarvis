@@ -14,8 +14,8 @@ The module detects model size from the model name and selects appropriate prompt
 
 | Model Size | Detection Pattern | Tool Prompts |
 |------------|-------------------|--------------|
-| SMALL | `:1b`, `:3b`, `:7b`, `gemma4` | Conservative — explicit "DO NOT use tools for greetings" + worked negative examples + repetition |
-| LARGE | All others (8b+) | Proactive — "use tools confidently" + short anti-confabulation + auto-derive clause |
+| SMALL | Regex `(\d+(?:\.\d+)?)(?:x(\d+))?b` — any parameter count ≤7.5B (e.g. `:0.8b`, `:3b`, `:7b`, `:2.7b`), plus `gemma4` family fallback when no size tag present | Conservative — explicit "DO NOT use tools for greetings" + worked negative examples + repetition |
+| LARGE | Models >7.5B (e.g. `:8b`, `:14b`, `:70b`, `gemma-4-12b`), MoE models (`8x7b`), or no size/family match | Proactive — "use tools confidently" + short anti-confabulation + auto-derive clause |
 
 ### Architecture
 
@@ -91,7 +91,7 @@ The reply engine detects model size early and passes it to `_build_initial_syste
 ```python
 from jarvis.reply.prompts import detect_model_size, get_system_prompts
 
-model_size = detect_model_size(cfg.ollama_chat_model)
+model_size = detect_model_size(cfg.llm_chat_model)
 prompts = get_system_prompts(model_size)
 
 # Build system message from prompts.to_list()

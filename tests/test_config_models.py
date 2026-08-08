@@ -162,8 +162,15 @@ class TestModelConsistency:
 
         The default model (gemma4:e2b) shares the intent judge, so its VRAM is the baseline.
         Other models must load both themselves AND the intent judge, so their VRAM must be higher.
+
+        Excludes explicit low-VRAM models (``qwen3.5:0.8b``) which are designed
+        for constrained hardware where the intent judge overhead is absorbed
+        by using the same model for both roles.
         """
         import re
+
+        # Models intentionally designed for low-VRAM / CPU fallback
+        LOW_VRAM_MODELS = {"qwen3.5:0.8b"}
 
         def _extract_vram_gb(vram_str: str) -> int:
             match = re.search(r"(\d+)", vram_str)
@@ -174,6 +181,8 @@ class TestModelConsistency:
 
         for model_id, info in SUPPORTED_CHAT_MODELS.items():
             if model_id == DEFAULT_CHAT_MODEL:
+                continue
+            if model_id in LOW_VRAM_MODELS:
                 continue
             model_vram = _extract_vram_gb(info["vram"])
             assert model_vram > default_vram, (

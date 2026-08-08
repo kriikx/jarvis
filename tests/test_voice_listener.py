@@ -1179,7 +1179,7 @@ class TestCorruptedWhisperCacheRecovery:
                             assert not snapshot_dir.exists()
 
     def test_corrupted_cache_retry_also_fails(self, tmp_path):
-        """When retry after cache clear also fails, model remains None."""
+        """When retry after cache clear also fails, fallback configs are still tried."""
         # Create a fake cache directory
         snapshot_dir = tmp_path / "models--Systran--faster-whisper-medium" / "snapshots" / "abc123"
         snapshot_dir.mkdir(parents=True)
@@ -1207,8 +1207,8 @@ class TestCorruptedWhisperCacheRecovery:
                             listener = VoiceListener(mock_db, mock_cfg, mock_tts, mock_dialogue_memory)
                             listener.run()
 
-                            # First attempt + retry = 2 calls
-                            assert mock_class.call_count == 2
+                            # The loop tried fallback configs (not just config 1's retry)
+                            assert mock_class.call_count > 2, "Expected fallback configs to be tried"
                             assert listener.model is None
 
     def test_corrupted_cache_parent_model_dir_deleted(self, tmp_path):
@@ -1258,7 +1258,7 @@ class TestCorruptedWhisperCacheRecovery:
                             assert not model_dir.exists()
 
     def test_unparseable_cache_path_shows_manual_instructions(self, capsys):
-        """When error path can't be parsed, shows manual cleanup instructions."""
+        """When error path can't be parsed, fallback configs are still tried with manual hints."""
         error_msg = "Unable to open file 'model.bin' somehow"
 
         with patch("jarvis.listening.listener.sys") as mock_sys:
@@ -1281,8 +1281,8 @@ class TestCorruptedWhisperCacheRecovery:
                             listener = VoiceListener(mock_db, mock_cfg, mock_tts, mock_dialogue_memory)
                             listener.run()
 
-                            # Should NOT retry (can't parse path)
-                            mock_class.assert_called_once()
+                            # The loop tried fallback configs (not just the first one)
+                            assert mock_class.call_count > 2, "Expected fallback configs to be tried"
                             assert listener.model is None
 
                             # Should show manual cleanup hint
@@ -1290,7 +1290,7 @@ class TestCorruptedWhisperCacheRecovery:
                             assert "whisper model cache" in captured.out.lower()
 
     def test_rmtree_oserror_prevents_retry(self, tmp_path):
-        """When shutil.rmtree raises OSError, model stays None and no retry occurs."""
+        """When shutil.rmtree raises OSError, fallback configs are still tried."""
         snapshot_dir = tmp_path / "models--Systran--faster-whisper-medium" / "snapshots" / "abc123"
         snapshot_dir.mkdir(parents=True)
         (snapshot_dir / "model.bin").write_bytes(b"corrupted")
@@ -1319,12 +1319,12 @@ class TestCorruptedWhisperCacheRecovery:
                                 listener = VoiceListener(mock_db, mock_cfg, mock_tts, mock_dialogue_memory)
                                 listener.run()
 
-                                # Only the initial attempt — no retry since cache could not be cleared
-                                mock_class.assert_called_once()
+                                # The loop tried fallback configs (not just the first one)
+                                assert mock_class.call_count > 2, "Expected fallback configs to be tried"
                                 assert listener.model is None
 
     def test_no_models_ancestor_prevents_cache_clear(self, tmp_path):
-        """When error path has no models-- ancestor, cache is not cleared and model stays None."""
+        """When error path has no models-- ancestor, fallback configs are still tried."""
         # Create a path without a models-- segment
         plain_dir = tmp_path / "some" / "random" / "path"
         plain_dir.mkdir(parents=True)
@@ -1352,9 +1352,57 @@ class TestCorruptedWhisperCacheRecovery:
                             listener = VoiceListener(mock_db, mock_cfg, mock_tts, mock_dialogue_memory)
                             listener.run()
 
-                            # No retry — _clear_corrupted_whisper_cache returns False
-                            mock_class.assert_called_once()
+                            # The loop tried fallback configs (not just the first one)
+                            assert mock_class.call_count > 2, "Expected fallback configs to be tried"
                             assert listener.model is None
+
+
+    def test_corrupted_cache_retry_fails_then_fallback_succeeds(self, tmp_path):
+        """When cache recovery retry fails, fallback to next device/compute config succeeds."""
+        mock_whisper_model = MagicMock()
+
+        # Create a fake cache directory
+        snapshot_dir = tmp_path / "models--Systran--faster-whisper-medium" / "snapshots" / "abc123"
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.bin").write_bytes(b"corrupted")
+
+        error_msg = f"Unable to open file 'model.bin' in model '{snapshot_dir}'"
+        call_count = 0
+
+        def whisper_model_side_effect(model_name, device, compute_type, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Config 1 ("auto", "int8"): first call fails, retry also fails
+            if call_count <= 2:
+                raise RuntimeError(error_msg)
+            # Config 2 ("auto", "float16"): third call succeeds
+            return mock_whisper_model
+
+        with patch("jarvis.listening.listener.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            with patch("jarvis.listening.listener.FASTER_WHISPER_AVAILABLE", True):
+                with patch("jarvis.listening.listener.MLX_WHISPER_AVAILABLE", False):
+                    with patch("jarvis.listening.listener.WhisperModel", side_effect=whisper_model_side_effect) as mock_class:
+                        with patch("jarvis.listening.listener.sd") as mock_sd:
+                            mock_sd.query_devices.return_value = [{"name": "Test Mic", "max_input_channels": 1}]
+                            mock_sd.InputStream.side_effect = Exception("Stop test here")
+
+                            from jarvis.listening.listener import VoiceListener
+
+                            mock_db = MagicMock()
+                            mock_cfg = _create_mock_config(whisper_model="medium")
+                            mock_tts = MagicMock()
+                            mock_dialogue_memory = MagicMock()
+
+                            listener = VoiceListener(mock_db, mock_cfg, mock_tts, mock_dialogue_memory)
+                            listener.run()
+
+                            # Call 1 (config 1 initial), call 2 (config 1 retry), call 3 (config 2, succeeds)
+                            assert mock_class.call_count == 3
+                            assert listener.model == mock_whisper_model
+
+                            # The corrupted snapshot directory should have been deleted
+                            assert not snapshot_dir.exists()
 
 
 class TestWhisperRateLimitRetry:
@@ -1501,6 +1549,7 @@ class TestWhisperRateLimitRetry:
 def _make_listener_for_warmup(
     chat_model: str = "llama3.1",
     judge_model: str | None = "gemma4:e2b",
+    embed_model: str = "",
     base_url: str = "http://127.0.0.1:11434",
 ):
     """Construct a VoiceListener with enough stubs to exercise warmup only."""
@@ -1516,9 +1565,11 @@ def _make_listener_for_warmup(
 
                 mock_cfg = _create_mock_config()
                 mock_cfg.ollama_chat_model = chat_model
+                mock_cfg.llm_chat_model = chat_model
+                mock_cfg.embedding_model = embed_model
                 mock_cfg.ollama_base_url = base_url
                 mock_cfg.llm_tools_timeout_sec = 8.0
-                mock_cfg.intent_judge_model = judge_model or ""
+                mock_cfg.fast_model = judge_model or ""
                 mock_cfg.intent_judge_timeout_sec = 10.0
                 mock_cfg.intent_judge_thinking_enabled = False
                 mock_cfg.wake_word = "jarvis"
@@ -1528,7 +1579,7 @@ def _make_listener_for_warmup(
 
                 if judge_model is not None:
                     listener._intent_judge = IntentJudge(
-                        IntentJudgeConfig(model=judge_model, ollama_base_url=base_url)
+                        IntentJudgeConfig(model=judge_model, cfg=mock_cfg)
                     )
                 else:
                     listener._intent_judge = None
@@ -1544,9 +1595,9 @@ class TestLlmWarmup:
             chat_model="llama3.1", judge_model="gemma4:e2b"
         )
         with patch(
-            "jarvis.listening.listener.warm_up_ollama_model", return_value=True
+            "jarvis.listening.listener.warm_up_chat_model", return_value=True
         ) as chat_warm, patch(
-            "jarvis.listening.intent_judge.warm_up_ollama_model", return_value=True
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=True
         ) as judge_warm:
             threads = listener._start_llm_warmup()
             for t in threads:
@@ -1563,7 +1614,7 @@ class TestLlmWarmup:
         listener = _make_listener_for_warmup(
             chat_model="llama3.1", judge_model="llama3.1"
         )
-        with patch("jarvis.listening.listener.warm_up_ollama_model", return_value=True) as warm:
+        with patch("jarvis.listening.listener.warm_up_chat_model", return_value=True) as warm:
             threads = listener._start_llm_warmup()
             for t in threads:
                 t.join(timeout=2.0)
@@ -1577,7 +1628,7 @@ class TestLlmWarmup:
         """Judge still warms when chat model is absent."""
         listener = _make_listener_for_warmup(chat_model="", judge_model="gemma4:e2b")
         with patch(
-            "jarvis.listening.intent_judge.warm_up_ollama_model", return_value=True
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=True
         ) as warm:
             threads = listener._start_llm_warmup()
             for t in threads:
@@ -1601,9 +1652,9 @@ class TestLlmWarmup:
             chat_model="llama3.1", judge_model="gemma4:e2b"
         )
         with patch(
-            "jarvis.listening.listener.warm_up_ollama_model", return_value=False
+            "jarvis.listening.listener.warm_up_chat_model", return_value=False
         ), patch(
-            "jarvis.listening.intent_judge.warm_up_ollama_model", return_value=False
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=False
         ):
             threads = listener._start_llm_warmup()
             for t in threads:
@@ -1611,6 +1662,115 @@ class TestLlmWarmup:
 
         assert listener._llm_warmup_results["chat"] == ("llama3.1", False)
         assert listener._llm_warmup_results["judge"] == ("gemma4:e2b", False)
+
+    def test_warms_embed_model_separately(self):
+        """Embed model gets its own warmup thread when distinct from chat."""
+        listener = _make_listener_for_warmup(
+            chat_model="llama3.1", embed_model="nomic-embed-text"
+        )
+        with patch(
+            "jarvis.listening.listener.warm_up_chat_model", return_value=True
+        ) as chat_warm, patch(
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=True
+        ) as judge_warm, patch(
+            "jarvis.listening.listener.get_embedding_backend"
+        ) as mock_get_embed:
+            mock_embed_backend = MagicMock()
+            mock_embed_backend.embed.return_value = [0.1, 0.2, 0.3]
+            mock_get_embed.return_value = mock_embed_backend
+
+            threads = listener._start_llm_warmup()
+            for t in threads:
+                t.join(timeout=2.0)
+
+        assert len(threads) == 3
+        assert chat_warm.call_args.args[1] == "llama3.1"
+        assert mock_embed_backend.embed.call_args.args == ("ping", "nomic-embed-text")
+        assert listener._llm_warmup_results["embed"] == ("nomic-embed-text", True)
+
+    def test_skips_embed_warmup_when_empty(self):
+        """No embed warmup thread when embedding_model is not configured."""
+        listener = _make_listener_for_warmup(
+            chat_model="llama3.1", embed_model=""
+        )
+        with patch(
+            "jarvis.listening.listener.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.listener.get_embedding_backend"
+        ) as mock_get_embed:
+            threads = listener._start_llm_warmup()
+            for t in threads:
+                t.join(timeout=2.0)
+
+        assert len(threads) == 2
+        assert not mock_get_embed.called
+        assert "embed" not in listener._llm_warmup_results
+
+    def test_embed_warmup_records_failure(self):
+        """None from embed() surfaces in the results dict as False."""
+        listener = _make_listener_for_warmup(
+            chat_model="llama3.1", embed_model="nomic-embed-text"
+        )
+        with patch(
+            "jarvis.listening.listener.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.listener.get_embedding_backend"
+        ) as mock_get_embed:
+            mock_embed_backend = MagicMock()
+            mock_embed_backend.embed.return_value = None
+            mock_get_embed.return_value = mock_embed_backend
+
+            threads = listener._start_llm_warmup()
+            for t in threads:
+                t.join(timeout=2.0)
+
+        assert listener._llm_warmup_results["embed"] == ("nomic-embed-text", False)
+
+    def test_embed_warmup_stores_failure_on_backend_init_exception(self):
+        """An exception in get_embedding_backend is caught and stored as False."""
+        listener = _make_listener_for_warmup(
+            chat_model="llama3.1", embed_model="nomic-embed-text"
+        )
+        with patch(
+            "jarvis.listening.listener.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.listener.get_embedding_backend"
+        ) as mock_get_embed:
+            mock_get_embed.side_effect = RuntimeError("backend init crashed")
+
+            threads = listener._start_llm_warmup()
+            for t in threads:
+                t.join(timeout=2.0)
+
+        assert listener._llm_warmup_results["embed"] == ("nomic-embed-text", False)
+
+    def test_embed_warmup_stores_failure_on_embed_exception(self):
+        """An exception in embed() is caught and stored as False."""
+        listener = _make_listener_for_warmup(
+            chat_model="llama3.1", embed_model="nomic-embed-text"
+        )
+        with patch(
+            "jarvis.listening.listener.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.intent_judge.warm_up_chat_model", return_value=True
+        ), patch(
+            "jarvis.listening.listener.get_embedding_backend"
+        ) as mock_get_embed:
+            mock_embed_backend = MagicMock()
+            mock_embed_backend.embed.side_effect = ConnectionError("server down")
+            mock_get_embed.return_value = mock_embed_backend
+
+            threads = listener._start_llm_warmup()
+            for t in threads:
+                t.join(timeout=2.0)
+
+        assert listener._llm_warmup_results["embed"] == ("nomic-embed-text", False)
 
 
 class TestWhisperWarmup:
@@ -1640,8 +1800,9 @@ class TestWhisperWarmup:
 
                             mock_cfg = _create_mock_config()
                             mock_cfg.ollama_chat_model = ""
+                            mock_cfg.llm_chat_model = ""
                             mock_cfg.ollama_base_url = ""
-                            mock_cfg.intent_judge_model = ""
+                            mock_cfg.fast_model = ""
                             listener = VoiceListener(
                                 MagicMock(), mock_cfg, MagicMock(), MagicMock()
                             )

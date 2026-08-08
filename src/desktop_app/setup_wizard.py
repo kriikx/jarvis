@@ -14,13 +14,18 @@ import platform
 import webbrowser
 import json
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict
+from typing import ClassVar, Optional, List, Tuple, Dict
 from dataclasses import dataclass
 from enum import Enum, auto
 
 import requests
 
 from jarvis.config import SUPPORTED_CHAT_MODELS, DEFAULT_CHAT_MODEL
+from jarvis.utils.vram import (
+    detect_total_vram_mb,
+    get_recommended_model_id,
+    required_vram_mb,
+)
 
 
 def is_apple_silicon() -> bool:
@@ -167,43 +172,47 @@ def check_ollama_server() -> Tuple[bool, Optional[str]]:
     except Exception:
         base_url = "http://127.0.0.1:11434"
 
-    try:
-        response = requests.get(f"{base_url}/api/version", timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            version = data.get("version", "unknown")
-            return True, version
-    except Exception:
-        pass
-
-    return False, None
+    from jarvis.llm import check_version
+    return check_version(base_url, timeout=5.0)
 
 
 def get_required_models() -> List[str]:
-    """Get list of required Ollama models from config.
+    """Get the Ollama models that must be present locally, given the active
+    providers.
 
-    Always includes:
-    - Chat model (user-selectable)
-    - Embedding model
-    - Intent judge model (gemma4 - required for voice intent classification)
+    Only models that actually run on Ollama are required:
+    - Chat model + intent-judge model — when the chat provider is Ollama
+      (both run through the chat backend). Skipped for an OpenAI-compatible
+      chat provider, where those are remote model names, not Ollama pulls.
+    - Embedding model — when the effective embedding provider is Ollama
+      (covers the advanced split where chat is remote but embeddings are
+      local). Skipped when embeddings are remote.
+
+    A pure OpenAI-compatible setup therefore requires nothing locally.
     """
     try:
         cfg = load_settings()
+        llm_provider = getattr(cfg, "llm_provider", "ollama") or "ollama"
+        embed_provider = getattr(cfg, "embedding_provider", "") or llm_provider
         models = []
 
-        # Chat model
-        if cfg.ollama_chat_model:
-            models.append(cfg.ollama_chat_model)
+        # Chat model runs on the chat provider's backend.
+        if llm_provider != "openai_compatible":
+            if cfg.ollama_chat_model:
+                models.append(cfg.ollama_chat_model)
 
-        # Embedding model
-        if cfg.ollama_embed_model:
-            models.append(cfg.ollama_embed_model)
+        # Embedding model runs on the embedding provider's backend.
+        if embed_provider != "openai_compatible":
+            if cfg.ollama_embed_model and cfg.ollama_embed_model not in models:
+                models.append(cfg.ollama_embed_model)
 
-        # Intent judge model - always required for voice intent classification
-        # This is separate from the chat model and cannot be changed by users
-        intent_judge_model = getattr(cfg, "intent_judge_model", "gemma4:e2b")
-        if intent_judge_model and intent_judge_model not in models:
-            models.append(intent_judge_model)
+        # The fast model powers voice intent classification and the other
+        # real-time passes, but is only an Ollama pull when the chat
+        # provider is Ollama (config load resolves it per provider).
+        if llm_provider != "openai_compatible":
+            fast_model = getattr(cfg, "fast_model", "gemma4:e2b")
+            if fast_model and fast_model not in models:
+                models.append(fast_model)
 
         return models
     except Exception:
@@ -310,17 +319,30 @@ def check_ollama_status() -> OllamaStatus:
     return status
 
 
-def should_show_setup_wizard() -> bool:
+def should_show_setup_wizard(force_server_check: bool = False) -> bool:
     """
     Check if the setup wizard should be shown.
 
     Returns True only if user intervention is needed:
     - CLI not installed (user must install Ollama)
     - Models missing (user must download models)
+    - Server unreachable after auto-start already failed (force_server_check)
 
     Does NOT return True just because server isn't running,
     since the app can auto-start the server if CLI is installed.
+    Pass ``force_server_check=True`` after auto-start has already been
+    attempted and failed to re-evaluate the unreachable-server case.
     """
+    # An OpenAI-compatible user has opted out of the local Ollama stack,
+    # so the Ollama-centric prerequisites don't apply — never auto-show.
+    # (The wizard can still be opened manually from the tray to switch back.)
+    try:
+        cfg = load_settings()
+        if getattr(cfg, "llm_provider", "ollama") == "openai_compatible":
+            return False
+    except Exception:
+        pass
+
     status = check_ollama_status()
 
     # If CLI not installed, user needs to install Ollama
@@ -329,6 +351,11 @@ def should_show_setup_wizard() -> bool:
 
     # If server is running and models are missing, user needs to download them
     if status.is_server_running and len(status.missing_models) > 0:
+        return True
+
+    # If auto-start already failed and server is still unreachable,
+    # the user needs to intervene to diagnose the problem.
+    if force_server_check and not status.is_server_running:
         return True
 
     # If CLI is installed but server not running, we can start it ourselves
@@ -346,7 +373,8 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QWizard, QWizardPage, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QProgressBar, QTextEdit, QWidget, QFrame,
-        QSizePolicy, QScrollArea, QLineEdit, QSlider, QComboBox, QCheckBox
+        QSizePolicy, QScrollArea, QLineEdit, QSlider, QComboBox, QCheckBox,
+        QRadioButton, QButtonGroup, QStackedWidget
     )
     from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject
     from PyQt6.QtGui import QFont, QColor, QPalette, QPixmap, QPainter
@@ -407,19 +435,45 @@ except ImportError:
     GEOIP2_AVAILABLE = False
 
 
-class StatusCheckWorker(QThread):
+class _KeepAliveWorker(QThread):
+    """QThread that keeps itself referenced until its OS thread has fully
+    finished.
+
+    Wizard pages rebind their worker attribute inside completion slots
+    (model install chains, refresh buttons, test-connection buttons). The
+    completion signal is emitted at the end of run(), so the slot can run
+    while the OS thread is still winding down; dropping the last Python
+    reference at that point destroys a running QThread and Qt aborts the
+    whole app ("Fatal Python error: Aborted" — #509, #407, #239).
+
+    Subclasses must NOT shadow the built-in ``finished`` signal — the
+    keep-alive registry relies on it to know when release is safe.
+    """
+
+    _active: ClassVar[set] = set()
+
+    def start(self, *args, **kwargs):
+        _KeepAliveWorker._active.add(self)
+        self.finished.connect(self._retire)
+        super().start(*args, **kwargs)
+
+    def _retire(self) -> None:
+        _KeepAliveWorker._active.discard(self)
+
+
+class StatusCheckWorker(_KeepAliveWorker):
     """Worker thread for checking Ollama status."""
-    finished = pyqtSignal(OllamaStatus)
+    status_ready = pyqtSignal(OllamaStatus)
 
     def run(self):
         status = check_ollama_status()
-        self.finished.emit(status)
+        self.status_ready.emit(status)
 
 
-class CommandWorker(QThread):
+class CommandWorker(_KeepAliveWorker):
     """Worker thread for running commands."""
     output = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
+    completed = pyqtSignal(bool, str)
 
     def __init__(self, command: List[str], parent=None):
         super().__init__(parent)
@@ -452,11 +506,11 @@ class CommandWorker(QThread):
             process.wait()
 
             if process.returncode == 0:
-                self.finished.emit(True, "✅ Command completed successfully")
+                self.completed.emit(True, "✅ Command completed successfully")
             else:
-                self.finished.emit(False, f"❌ Command failed with exit code {process.returncode}")
+                self.completed.emit(False, f"❌ Command failed with exit code {process.returncode}")
         except Exception as e:
-            self.finished.emit(False, f"❌ Error: {str(e)}")
+            self.completed.emit(False, f"❌ Error: {str(e)}")
 
 
 class SetupWizard(QWizard):
@@ -473,6 +527,8 @@ class SetupWizard(QWizard):
 
         # Add pages and store their IDs
         self.welcome_page = WelcomePage(self)
+        self.provider_choice_page = ProviderChoicePage(self)
+        self.openai_compat_page = OpenAICompatiblePage(self)
         self.ollama_install_page = OllamaInstallPage(self)
         self.ollama_server_page = OllamaServerPage(self)
         self.models_page = ModelsPage(self)
@@ -484,15 +540,23 @@ class SetupWizard(QWizard):
         self.complete_page = CompletePage(self)
 
         self.welcome_page_id = self.addPage(self.welcome_page)
+        self.mlx_whisper_page_id = self.addPage(self.mlx_whisper_page)
+        self.provider_choice_page_id = self.addPage(self.provider_choice_page)
+        self.openai_compat_page_id = self.addPage(self.openai_compat_page)
         self.ollama_install_page_id = self.addPage(self.ollama_install_page)
         self.ollama_server_page_id = self.addPage(self.ollama_server_page)
         self.models_page_id = self.addPage(self.models_page)
-        self.mlx_whisper_page_id = self.addPage(self.mlx_whisper_page)
         self.dictation_page_id = self.addPage(self.dictation_page)
         self.mcp_page_id = self.addPage(self.mcp_page)
         self.search_providers_page_id = self.addPage(self.search_providers_page)
         self.location_page_id = self.addPage(self.location_page)
         self.complete_page_id = self.addPage(self.complete_page)
+
+        # The provider choice is the first step: Ollama is optional now, so
+        # the wizard must ask which runtime the user wants before running any
+        # Ollama-specific checks. The Welcome/status page and the Ollama
+        # install/server/models pages are only reached on the Ollama branch.
+        self.setStartId(self.mlx_whisper_page_id)
 
         # Custom button labels
         self.setButtonText(QWizard.WizardButton.NextButton, "Next →")
@@ -504,6 +568,17 @@ class SetupWizard(QWizard):
         self.ollama_status: Optional[OllamaStatus] = None
         self.mlx_whisper_status: Optional[MLXWhisperStatus] = None
         self._location_working: Optional[bool] = None
+
+    def ollama_entry_page_id(self) -> int:
+        """First Ollama-flow page to show, based on detection status:
+        install (CLI missing) → server (not running) → models. Shared by the
+        provider-choice page so the Ollama branch lands on the right step."""
+        status = self.ollama_status
+        if status is None or not status.is_cli_installed:
+            return self.ollama_install_page_id
+        if not status.is_server_running:
+            return self.ollama_server_page_id
+        return self.models_page_id
 
     def is_location_working(self) -> bool:
         """Check if location detection is working (cached)."""
@@ -708,7 +783,7 @@ class WelcomePage(QWizardPage):
 
         # Start background check
         self.worker = StatusCheckWorker()
-        self.worker.finished.connect(self._on_status_checked)
+        self.worker.status_ready.connect(self._on_status_checked)
         self.worker.start()
 
     def _on_status_checked(self, status: OllamaStatus):
@@ -782,21 +857,676 @@ class WelcomePage(QWizardPage):
         return True
 
     def nextId(self) -> int:
-        """Determine next page based on status."""
+        """The Welcome/status page is reached only on the Ollama branch (after
+        the provider choice), so it leads into the Ollama install/server/models
+        flow based on the detected status."""
         wizard = self.wizard()
-        if not isinstance(wizard, SetupWizard) or wizard.ollama_status is None:
-            return wizard.ollama_install_page_id
+        if not isinstance(wizard, SetupWizard):
+            return super().nextId()
+        return wizard.ollama_entry_page_id()
 
-        status = wizard.ollama_status
 
-        # Skip to appropriate page based on what's missing
-        if not status.is_cli_installed:
-            return wizard.ollama_install_page_id
-        elif not status.is_server_running:
-            return wizard.ollama_server_page_id
+class ProviderChoicePage(QWizardPage):
+    """Choose which local runtime serves the LLM: Ollama (the bundled
+    default) or an OpenAI-compatible server (LM Studio, oMLX, llama.cpp's
+    ``llama-server``, vLLM, LocalAI). The choice branches the rest of the
+    wizard — Ollama continues to the install/server/models flow, while
+    OpenAI-compatible jumps to a connection-config page and skips the
+    Ollama-specific pages entirely."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("")
+        self._selected = "ollama"
+
+        layout = QVBoxLayout()
+        layout.setSpacing(16)
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        title = QLabel("🔌 Choose Your LLM Provider")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Welcome to Jarvis. Choose how it runs its language model. Both "
+            "options keep everything on machines you control, never a "
+            "third-party cloud."
+        )
+        subtitle.setObjectName("subtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(4)
+
+        # A QButtonGroup makes the radios mutually exclusive even though each
+        # lives in its own card (Qt's auto-exclusivity only applies to radios
+        # sharing a direct parent, which these do not).
+        self._button_group = QButtonGroup(self)
+
+        self._ollama_radio = QRadioButton("  🦙  Ollama (recommended)")
+        self._ollama_radio.setChecked(True)
+        self._button_group.addButton(self._ollama_radio)
+        ollama_card = self._provider_card(
+            self._ollama_radio,
+            "Runs open models locally on this machine. The wizard installs "
+            "Ollama and downloads the models for you. Best if you have no "
+            "model server already.",
+        )
+        layout.addWidget(ollama_card)
+
+        self._openai_radio = QRadioButton("  🔗  OpenAI-compatible server")
+        self._button_group.addButton(self._openai_radio)
+        openai_card = self._provider_card(
+            self._openai_radio,
+            "Point Jarvis at a server that speaks the OpenAI API. This is "
+            "usually another local app (LM Studio, oMLX, llama.cpp, vLLM, "
+            "LocalAI) running on your own machine or network. You provide its "
+            "URL and model name on the next step.",
+        )
+        layout.addWidget(openai_card)
+
+        self._ollama_radio.toggled.connect(self._on_toggle)
+        self._openai_radio.toggled.connect(self._on_toggle)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+        self._preselect_from_config()
+
+    def _provider_card(self, radio, desc_text):
+        card = QFrame()
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(6)
+        radio.setStyleSheet("font-size: 15px; font-weight: bold;")
+        card_layout.addWidget(radio)
+        desc = QLabel(desc_text)
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #a1a1aa; font-size: 13px;")
+        card_layout.addWidget(desc)
+        return card
+
+    def _preselect_from_config(self):
+        try:
+            from jarvis.config import default_config_path, _load_json
+            config = _load_json(default_config_path()) or {}
+            provider = str(config.get("llm_provider", "ollama") or "ollama")
+        except Exception:
+            provider = "ollama"
+        if provider == "openai_compatible":
+            self._openai_radio.setChecked(True)
+            self._selected = "openai_compatible"
         else:
-            # Always show models page so users can change their model selection
-            return wizard.models_page_id
+            self._ollama_radio.setChecked(True)
+            self._selected = "ollama"
+
+    def _on_toggle(self):
+        self._selected = (
+            "openai_compatible" if self._openai_radio.isChecked() else "ollama"
+        )
+
+    def validatePage(self) -> bool:
+        """Persist the provider choice. Selecting Ollama clears any
+        OpenAI-compatible overrides so the Ollama settings become
+        authoritative again — no stale base URL / key / model is left
+        pointing at a former remote server."""
+        try:
+            from jarvis.config import default_config_path, _load_json, _save_json
+            config_path = default_config_path()
+            config = _load_json(config_path) or {}
+
+            if self._selected == "openai_compatible":
+                config["llm_provider"] = "openai_compatible"
+            else:
+                # Ollama is the default; omit the key and drop the
+                # OpenAI-compatible connection overrides.
+                config.pop("llm_provider", None)
+                for stale in (
+                    "llm_base_url", "llm_api_key", "llm_chat_model",
+                    "embedding_provider", "embedding_base_url",
+                    "embedding_api_key", "embedding_model",
+                ):
+                    config.pop(stale, None)
+
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            _save_json(config_path, config)
+        except Exception:
+            pass
+        return True
+
+    def isComplete(self) -> bool:
+        return True
+
+    def nextId(self) -> int:
+        wizard = self.wizard()
+        if not isinstance(wizard, SetupWizard):
+            return super().nextId()
+        if self._selected == "openai_compatible":
+            return wizard.openai_compat_page_id
+        return wizard.welcome_page_id
+
+
+class _ModelFetchWorker(_KeepAliveWorker):
+    """Fetches the model list from an OpenAI-compatible server off the UI
+    thread so the wizard never freezes while connecting."""
+
+    done = pyqtSignal(bool, list)  # (reached, model_ids)
+
+    def __init__(self, base_url: str, api_key: str):
+        super().__init__()
+        self._base_url = base_url
+        self._api_key = api_key
+
+    def run(self):
+        models = OpenAICompatiblePage._fetch_models(self._base_url, self._api_key)
+        self.done.emit(bool(models), models)
+
+
+class _DiscoveryWorker(QThread):
+    """Probes well-known local ports for a running OpenAI-compatible server so
+    the wizard can offer a one-click pick instead of asking for a URL."""
+
+    done = pyqtSignal(list)  # list of (label, url)
+
+    def __init__(self, candidates: list):
+        super().__init__()
+        self._candidates = candidates
+
+    def run(self):
+        self.done.emit(OpenAICompatiblePage._discover_servers(self._candidates))
+
+
+class _CapabilityWorker(QThread):
+    """Probes what the chosen server+model can actually do (chat, tools,
+    embeddings) off the UI thread, so the wizard catches a dud model or a
+    missing embeddings endpoint before setup finishes rather than at runtime."""
+
+    done = pyqtSignal(object)  # ServerCapabilities
+
+    def __init__(self, base_url: str, api_key: str, chat_model: str, embed_model: str):
+        super().__init__()
+        self._base_url = base_url
+        self._api_key = api_key
+        self._chat_model = chat_model
+        self._embed_model = embed_model
+
+    def run(self):
+        try:
+            from jarvis.llm import OpenAICompatibleBackend, ServerCapabilities
+            backend = OpenAICompatibleBackend(self._base_url, api_key=self._api_key or None)
+            caps = backend.check_capabilities(self._chat_model, self._embed_model or None)
+        except Exception:
+            from jarvis.llm import ServerCapabilities
+            caps = ServerCapabilities()
+        self.done.emit(caps)
+
+
+class OpenAICompatiblePage(QWizardPage):
+    """Collect the OpenAI-compatible server's connection details. Shown only
+    on the OpenAI-compatible branch; it writes the ``llm_*`` /
+    ``embedding_model`` config keys and then skips straight to Whisper setup.
+
+    Guided rather than freeform: the page auto-discovers running local
+    servers, offers a one-click app preset, and (after Connect) fetches the
+    server's actual model list into editable dropdowns with sensible defaults.
+    A single Connect then probes the chosen model so the user learns up front
+    whether chat, tool calling, and embeddings work, and is offered the
+    Ollama-embeddings fallback when the server can't embed. Power users can
+    still type any base URL or model id by hand.
+    """
+
+    _DEFAULT_BASE_URL = "http://localhost:1234/v1"  # LM Studio default
+
+    # Well-known local OpenAI-compatible servers, used both for the app preset
+    # picker and for auto-discovery. All loopback, so probing never leaves the
+    # machine.
+    _KNOWN_SERVERS = [
+        ("LM Studio", "http://localhost:1234/v1"),
+        ("Ollama (OpenAI API)", "http://localhost:11434/v1"),
+        ("Jan", "http://localhost:1337/v1"),
+        ("llama.cpp / LocalAI", "http://localhost:8080/v1"),
+        ("vLLM", "http://localhost:8000/v1"),
+        ("oMLX (ol.mlx)", "http://localhost:9876/v1"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("")
+        self._fetch_worker = None
+        self._discovery_worker = None
+        self._cap_worker = None
+
+        layout = QVBoxLayout()
+        layout.setSpacing(14)
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        title = QLabel("🔗 OpenAI-compatible Server")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Point Jarvis at a local server (LM Studio, Ollama, Jan, llama.cpp, "
+            "vLLM, …). Pick your app or let Jarvis find it, then Connect to load "
+            "its models. Only the base URL and chat model are required."
+        )
+        subtitle.setObjectName("subtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(4)
+
+        form_card = QFrame()
+        form_card.setObjectName("card")
+        form = QVBoxLayout(form_card)
+        form.setContentsMargins(16, 14, 16, 14)
+        form.setSpacing(10)
+
+        # App preset: prefills the base URL for a known server so the user
+        # never has to remember a port.
+        preset_label = QLabel("Your app")
+        preset_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        form.addWidget(preset_label)
+        self._preset_combo = QComboBox()
+        self._preset_combo.addItem("Select your app (optional)…")
+        for label, _url in self._KNOWN_SERVERS:
+            self._preset_combo.addItem(label)
+        self._preset_combo.addItem("Other / custom")
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        form.addWidget(self._preset_combo)
+
+        self._base_url_input = self._labelled_edit(
+            form, "Base URL",
+            "e.g. http://localhost:1234/v1 (LM Studio default)")
+        self._api_key_input = self._labelled_edit(
+            form, "API key (optional)", "leave empty if your server needs none",
+            password=True)
+
+        # Connect button + status: fetch the model list, then probe the model.
+        self._connect_btn = QPushButton("🔌 Connect & load models")
+        self._connect_btn.setObjectName("secondary")
+        self._connect_btn.clicked.connect(self._on_connect)
+        form.addWidget(self._connect_btn)
+        self._connect_status = QLabel("")
+        self._connect_status.setWordWrap(True)
+        self._connect_status.setStyleSheet(
+            f"font-size: 12px; color: {COLORS['text_secondary']};")
+        form.addWidget(self._connect_status)
+
+        self._chat_model_combo = self._labelled_combo(
+            form, "Chat model", "pick after connecting, or type the model id")
+        self._embed_model_combo = self._labelled_combo(
+            form, "Embedding model (optional)",
+            "leave empty to skip embeddings (memory uses keyword search)")
+
+        # Fast model link toggle + selector
+        self._openai_linked = False
+        self._openai_link_cb = QCheckBox(
+            "\u2699\ufe0f Use same model for fast tasks (voice, routing)")
+        self._openai_link_cb.setChecked(False)
+        self._openai_link_cb.setStyleSheet("font-size: 13px; color: #e4e4e7; padding: 4px 0;")
+        self._openai_link_cb.toggled.connect(self._on_openai_link_toggled)
+        form.addWidget(self._openai_link_cb)
+
+        # Fast model selector: label + combo stored for visibility toggling
+        self._fast_label = QLabel("Fast model (voice intent, tool routing)")
+        self._fast_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        form.addWidget(self._fast_label)
+        self._fast_model_combo = QComboBox()
+        self._fast_model_combo.setEditable(True)
+        self._fast_model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._fast_model_combo.lineEdit().setPlaceholderText(
+            "leave empty to use the chat model")
+        self._fast_model_combo.currentTextChanged.connect(
+            lambda *_: self.completeChanged.emit())
+        form.addWidget(self._fast_model_combo)
+        self._fast_label.setVisible(True)
+        self._fast_model_combo.setVisible(True)
+
+        # Shown only when the probe finds the server can't embed: a one-click
+        # way to keep full semantic memory by routing embeddings to Ollama.
+        self._use_ollama_embed = QCheckBox(
+            "Use Ollama for embeddings instead (keeps full semantic memory)")
+        self._use_ollama_embed.setVisible(False)
+        self._use_ollama_embed.toggled.connect(lambda *_: self.completeChanged.emit())
+        form.addWidget(self._use_ollama_embed)
+
+        layout.addWidget(form_card)
+
+        tip = QLabel(
+            "💡  Memory search uses embeddings. If your server has no "
+            "embeddings endpoint, leave the embedding model empty and Jarvis "
+            "falls back to keyword search."
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet(
+            "background: rgba(245, 158, 11, 0.10);"
+            "border: 1px solid rgba(245, 158, 11, 0.25);"
+            "border-radius: 8px; padding: 12px 16px; color: #fbbf24; font-size: 13px;"
+        )
+        layout.addWidget(tip)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def _labelled_edit(self, form, label_text, placeholder, password=False):
+        label = QLabel(label_text)
+        label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        form.addWidget(label)
+        field = QLineEdit()
+        field.setPlaceholderText(placeholder)
+        if password:
+            field.setEchoMode(QLineEdit.EchoMode.Password)
+        # Re-evaluate Next: the base URL is half of isComplete, so editing it
+        # must refresh the button (the chat-model combo does the same).
+        field.textChanged.connect(lambda *_: self.completeChanged.emit())
+        form.addWidget(field)
+        return field
+
+    def _labelled_combo(self, form, label_text, placeholder):
+        label = QLabel(label_text)
+        label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        form.addWidget(label)
+        combo = QComboBox()
+        combo.setEditable(True)  # power users can type a model the listing omits
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        combo.lineEdit().setPlaceholderText(placeholder)
+        combo.currentTextChanged.connect(lambda *_: self.completeChanged.emit())
+        form.addWidget(combo)
+        return combo
+
+    @staticmethod
+    def _fetch_models(base_url: str, api_key: str, timeout: float = 6.0) -> list:
+        """Return the model ids the server advertises at ``/v1/models``, or
+        an empty list if it is unreachable. Fail-soft: never raises, so the
+        user can still type a model id by hand."""
+        base_url = (base_url or "").strip()
+        if not base_url:
+            return []
+        try:
+            from jarvis.llm import OpenAICompatibleBackend
+            backend = OpenAICompatibleBackend(base_url, api_key=(api_key or "").strip() or None)
+            return list(backend.list_models(timeout_sec=timeout))
+        except Exception:
+            return []
+
+    @staticmethod
+    def _discover_servers(candidates: list, timeout: float = 1.5) -> list:
+        """Probe well-known local ports for a running OpenAI-compatible server.
+        Only loopback addresses are probed, so discovery never touches the
+        network. Returns the reachable ``(label, url)`` pairs."""
+        found = []
+        for label, url in candidates:
+            if OpenAICompatiblePage._fetch_models(url, "", timeout=timeout):
+                found.append((label, url))
+        return found
+
+    @staticmethod
+    def _classify_models(models: list) -> tuple:
+        """Split advertised ids into ``(chat, embed)`` by an id heuristic.
+        Model ids are vendor tokens rather than natural language, so matching
+        ``embed`` in the id stays language-agnostic."""
+        embed = [m for m in models if "embed" in m.lower()]
+        chat = [m for m in models if "embed" not in m.lower()]
+        return chat, embed
+
+    @staticmethod
+    def _preferred_fast_default(models: list) -> str:
+        """Return ``gemma4:e2b`` when it appears in the model list, otherwise
+        empty string (user picks or types)."""
+        for m in models:
+            if m == "gemma4:e2b":
+                return m
+        return ""
+
+    def _on_preset_changed(self, idx: int):
+        # idx 0 is the placeholder and the last item is "Other / custom"; the
+        # ones in between map to _KNOWN_SERVERS and prefill the base URL.
+        if 1 <= idx <= len(self._KNOWN_SERVERS):
+            _label, url = self._KNOWN_SERVERS[idx - 1]
+            self._base_url_input.setText(url)
+
+    def _on_openai_link_toggled(self, linked: bool):
+        """Show/hide the fast model selector when toggling the link checkbox."""
+        self._openai_linked = linked
+        self._fast_label.setVisible(not linked)
+        self._fast_model_combo.setVisible(not linked)
+        if linked:
+            self._fast_model_combo.setCurrentText("")
+        # Let the wizard recalculate its size from the current page's content
+        wizard = self.wizard()
+        if wizard:
+            wizard.adjustSize()
+        self.completeChanged.emit()
+
+    def _on_connect(self):
+        base_url = (self._base_url_input.text() or "").strip()
+        if not base_url:
+            self._connect_status.setText("⚠️ Enter a base URL first.")
+            return
+        self._connect_btn.setEnabled(False)
+        self._connect_status.setText("⏳ Connecting…")
+        worker = _ModelFetchWorker(base_url, (self._api_key_input.text() or "").strip())
+        worker.done.connect(self._on_models_fetched)
+        self._fetch_worker = worker  # keep a reference so it isn't GC'd
+        worker.start()
+
+    def _on_models_fetched(self, reached: bool, models: list):
+        self._populate_models(models)
+        if not (reached and models):
+            self._connect_btn.setEnabled(True)
+            self._connect_status.setText(
+                "⚠️ Couldn't load models. Check the URL/key and that the server "
+                "is running, or type the model id manually below.")
+            self.completeChanged.emit()
+            return
+        # Models loaded and a sensible chat default is selected — probe the
+        # model so the user learns up front what works.
+        chat = (self._chat_model_combo.currentText() or "").strip()
+        base = (self._base_url_input.text() or "").strip()
+        if base and chat:
+            self._connect_status.setText(
+                f"✅ Connected — {len(models)} model(s). Checking {chat}…")
+            self._start_capability_probe()
+        else:
+            self._connect_btn.setEnabled(True)
+            self._connect_status.setText(f"✅ Connected — {len(models)} model(s) found.")
+        self.completeChanged.emit()
+
+    def _start_capability_probe(self):
+        base = (self._base_url_input.text() or "").strip()
+        chat = (self._chat_model_combo.currentText() or "").strip()
+        if not (base and chat):
+            self._connect_btn.setEnabled(True)
+            return
+        self._connect_btn.setEnabled(False)
+        worker = _CapabilityWorker(
+            base, (self._api_key_input.text() or "").strip(),
+            chat, (self._embed_model_combo.currentText() or "").strip())
+        worker.done.connect(self._on_capabilities)
+        self._cap_worker = worker  # keep a reference so it isn't GC'd
+        worker.start()
+
+    def _on_capabilities(self, caps):
+        self._connect_btn.setEnabled(True)
+        self._connect_status.setText(self._capability_summary(caps))
+        # Offer the Ollama-embeddings split only when the server clearly works
+        # for chat but cannot embed.
+        needs_split = bool(getattr(caps, "reachable", False)
+                           and getattr(caps, "chat", False)
+                           and not getattr(caps, "embeddings", False))
+        self._use_ollama_embed.setVisible(needs_split)
+        if not needs_split:
+            self._use_ollama_embed.setChecked(False)
+        self.completeChanged.emit()
+
+    @staticmethod
+    def _capability_summary(caps) -> str:
+        """Honest one-line verdict on what the chosen server+model can do."""
+        if not getattr(caps, "reachable", False):
+            return ("⚠️ Couldn't get a response with that model. Check the URL, "
+                    "key, and that the model id is loaded on the server.")
+        mark = lambda ok: "✅" if ok else "⚠️"
+        parts = [f"{mark(caps.chat)} Chat", f"{mark(caps.tools)} Tool calling"]
+        parts.append("✅ Embeddings" if caps.embeddings
+                     else "⚠️ No embeddings (memory uses keyword search)")
+        return "   ".join(parts)
+
+    def _populate_models(self, models: list):
+        """Fill the dropdowns with fetched model ids. Embedding-named ids go to
+        the embedding box and the rest to chat; if the heuristic finds none of
+        a kind, both boxes get the full list. A value the user already
+        typed/selected is preserved, otherwise a sensible default is applied so
+        the common case is just Connect then Next."""
+        chat_models, embed_models = self._classify_models(models)
+        # The chat box lists chat models (or the full list if the heuristic
+        # found none), but only auto-selects a real chat model — never an
+        # embedding model, which would be a wrong default.
+        self._fill_combo(self._chat_model_combo, chat_models or models, blank=False,
+                         default=(chat_models[0] if chat_models else ""))
+        self._fill_combo(self._embed_model_combo, embed_models or models, blank=True,
+                         default=(embed_models[0] if embed_models else ""))
+        self._fill_combo(self._fast_model_combo, models, blank=True,
+                         default=self._preferred_fast_default(models))
+
+    def _fill_combo(self, combo, items, *, blank: bool, default: str):
+        current = (combo.currentText() or "").strip()
+        combo.blockSignals(True)
+        combo.clear()
+        if blank:
+            combo.addItem("")  # "(none)" — embeddings optional
+        for it in items:
+            combo.addItem(it)
+        combo.setCurrentText(current or default)
+        combo.blockSignals(False)
+
+    def initializePage(self):
+        """Pre-fill from any existing config so re-running the wizard keeps the
+        user's values. With no saved URL, default to the common LM Studio
+        address and kick off auto-discovery of running local servers."""
+        try:
+            from jarvis.config import default_config_path, _load_json
+            config = _load_json(default_config_path()) or {}
+        except Exception:
+            config = {}
+        saved_url = str(config.get("llm_base_url", "") or "")
+        self._base_url_input.setText(saved_url or self._DEFAULT_BASE_URL)
+        self._api_key_input.setText(str(config.get("llm_api_key", "") or ""))
+        self._chat_model_combo.setCurrentText(str(config.get("llm_chat_model", "") or ""))
+        self._embed_model_combo.setCurrentText(str(config.get("embedding_model", "") or ""))
+        saved_fast = str(config.get("fast_model", "") or "")
+        self._fast_model_combo.setCurrentText(saved_fast)
+        if saved_fast:
+            self._openai_linked = False
+            self._openai_link_cb.setChecked(False)
+            self._fast_label.setVisible(True)
+            self._fast_model_combo.setVisible(True)
+        self._use_ollama_embed.setVisible(False)
+        self._connect_status.setText("")
+        # Only auto-discover when the user hasn't already saved a custom URL.
+        if not saved_url:
+            self._start_discovery()
+        # Force the wizard to recalculate its height for this page's content.
+        # Without this, Qt compresses widgets to fit the wizard's current size
+        # instead of growing the window (see CLAUDE.md Qt Layout section).
+        wizard = self.wizard()
+        if wizard:
+            QTimer.singleShot(0, wizard.adjustSize)
+
+    def _start_discovery(self):
+        self._connect_status.setText("🔍 Looking for local servers…")
+        worker = _DiscoveryWorker(list(self._KNOWN_SERVERS))
+        worker.done.connect(self._on_discovered)
+        self._discovery_worker = worker  # keep a reference so it isn't GC'd
+        worker.start()
+
+    def _on_discovered(self, found: list):
+        if not found:
+            self._connect_status.setText("")  # nothing running; user enters details
+            return
+        label, url = found[0]
+        # Prefill the first hit unless the user already changed the default.
+        if (self._base_url_input.text() or "").strip() in ("", self._DEFAULT_BASE_URL):
+            self._base_url_input.setText(url)
+        if len(found) == 1:
+            self._connect_status.setText(
+                f"🔍 Found {label} at {url} — click Connect to load its models.")
+        else:
+            names = ", ".join(l for l, _ in found)
+            self._connect_status.setText(
+                f"🔍 Found {len(found)} servers ({names}). Pick one above, then Connect.")
+
+    @staticmethod
+    def _is_ready(base_url: str, chat_model: str) -> bool:
+        return bool((base_url or "").strip()) and bool((chat_model or "").strip())
+
+    def _read_inputs(self):
+        return (
+            (self._base_url_input.text() or "").strip(),
+            (self._api_key_input.text() or "").strip(),
+            (self._chat_model_combo.currentText() or "").strip(),
+            (self._embed_model_combo.currentText() or "").strip(),
+            (self._fast_model_combo.currentText() or "").strip(),
+        )
+
+    def isComplete(self) -> bool:
+        base_url, _, chat_model, _, _ = self._read_inputs()
+        return self._is_ready(base_url, chat_model)
+
+    def validatePage(self) -> bool:
+        """Persist the connection details. Required fields are always
+        written; optional ones (API key, embedding model) are omitted when
+        empty to keep config.json minimal."""
+        base_url, api_key, chat_model, embed_model, fast_model = self._read_inputs()
+        if not self._is_ready(base_url, chat_model):
+            return False
+        try:
+            from jarvis.config import default_config_path, _load_json, _save_json
+            config_path = default_config_path()
+            config = _load_json(config_path) or {}
+
+            config["llm_provider"] = "openai_compatible"
+            config["llm_base_url"] = base_url
+            config["llm_chat_model"] = chat_model
+            if api_key:
+                config["llm_api_key"] = api_key
+            else:
+                config.pop("llm_api_key", None)
+
+            # Embeddings: when the server can't embed and the user opted for the
+            # Ollama fallback, route embeddings to Ollama and drop the remote
+            # embedding model (Ollama's default applies). Otherwise keep
+            # embeddings on this provider, writing the model only when set.
+            if self._use_ollama_embed.isVisible() and self._use_ollama_embed.isChecked():
+                config["embedding_provider"] = "ollama"
+                config.pop("embedding_model", None)
+            else:
+                config.pop("embedding_provider", None)
+                if embed_model:
+                    config["embedding_model"] = embed_model
+                else:
+                    config.pop("embedding_model", None)
+
+            # Save fast model: when linked it's left empty (defaults to chat)
+            # Save fast model: write only when unlinked and non-empty
+            is_linked = True  # safe default (backward compat for __new__-constructed pages)
+            try:
+                is_linked = self._openai_linked
+            except Exception:
+                pass
+            config["fast_model"] = fast_model if (not is_linked and fast_model) else ""
+
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            _save_json(config_path, config)
+        except Exception:
+            pass
+        return True
+
+    def nextId(self) -> int:
+        wizard = self.wizard()
+        if isinstance(wizard, SetupWizard):
+            return wizard.dictation_page_id
+        return super().nextId()
 
 
 class OllamaInstallPage(QWizardPage):
@@ -1139,17 +1869,34 @@ class OllamaServerPage(QWizardPage):
 
 
 class ModelsPage(QWizardPage):
-    """Page for installing required AI models."""
+    """Page for installing required AI models — dual-category (fast + chat)."""
 
-    # Use the centralized model configuration from config.py
     MODEL_OPTIONS = SUPPORTED_CHAT_MODELS
+    _ALL_MODELS = MODEL_OPTIONS
+    _FAST_MODEL_IDS = ["qwen3.5:0.8b", "gemma4:e2b"]
 
-    # Wizard heights: base matches SetupWizard.setMinimumSize (all models
-    # installed, install/skip row hidden); with-buttons adds space for the
-    # install/skip row + three-line missing-models label; installing further
-    # adds the progress bar (~22px) + log output (max 150px) + two 20px
-    # layout gaps on top of with-buttons so the install/skip row stays at
-    # its natural size instead of getting squished.
+    # VRAM overhead for always-running companion models (MB).
+    # nomic-embed-text: ~1 GB for ~1.5K dim semantic search.
+    # Whisper small: ~2 GB (the wizard balance default).
+    _EMBED_VRAM_MB = 1024
+    _WHISPER_VRAM_MB = 2048
+
+    def _whisper_vram_mb(self) -> int:
+        """VRAM in MB for the currently-configured whisper model.
+
+        Reads the saved whisper model from config (set by WhisperSetupPage
+        which now runs before this page).  Falls back to ``_WHISPER_VRAM_MB``
+        (2048 MB = whisper small) when unavailable.
+        """
+        try:
+            cfg = load_settings()
+            model_id = getattr(cfg, "whisper_model", None)
+            if model_id:
+                return WhisperSetupPage.get_whisper_vram_mb(model_id)
+        except Exception:
+            pass
+        return self._WHISPER_VRAM_MB
+
     _WIZARD_HEIGHT_BASE = 875
     _WIZARD_HEIGHT_WITH_BUTTONS = 955
     _WIZARD_HEIGHT_INSTALLING = 1170
@@ -1157,108 +1904,124 @@ class ModelsPage(QWizardPage):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setTitle("")
+        self._linked = False
+        self._chat_model = DEFAULT_CHAT_MODEL
+        self._fast_model = "gemma4:e2b"
+        self._detected_vram_mb = None
 
         layout = QVBoxLayout()
-        layout.setSpacing(20)
+        layout.setSpacing(16)
         layout.setContentsMargins(40, 40, 40, 40)
 
-        # Header
         title = QLabel("🧠 Install AI Models")
         title.setObjectName("title")
         layout.addWidget(title)
 
-        subtitle = QLabel("Jarvis needs specific AI models to work. Choose your model and install.")
+        subtitle = QLabel(
+            "Jarvis needs a chat model (conversations) and a fast model "
+            "(voice intent, tool routing). Pick them separately for "
+            "best VRAM usage."
+        )
         subtitle.setObjectName("subtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
+        layout.addSpacing(8)
 
-        layout.addSpacing(20)
+        # Link toggle (off by default — separate models recommended)
+        self._link_cb = QCheckBox("\u2699\ufe0f Use same model for both roles")
+        self._link_cb.setChecked(False)
+        self._link_cb.setStyleSheet("font-size: 14px; color: #e4e4e7; padding: 4px 0;")
+        self._link_cb.toggled.connect(self._on_link_toggled)
+        layout.addWidget(self._link_cb)
 
-        # Model selection card
+        hint = QLabel(
+            "When linked, one model handles both chat and fast tasks "
+            "(shares VRAM). Separate models let you pick a lightweight "
+            "fast model."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 11px; color: #71717a; padding: 0 0 0 24px;")
+        layout.addWidget(hint)
+        layout.addSpacing(8)
+
+        # Model selection card with dropdowns
         selection_card = QFrame()
         selection_card.setObjectName("card")
-        # Override card padding to prevent layout issues
-        selection_card.setStyleSheet(selection_card.styleSheet() + "QFrame#card { padding: 0px; }")
-        selection_layout = QVBoxLayout(selection_card)
-        selection_layout.setContentsMargins(24, 24, 24, 24)
-        selection_layout.setSpacing(16)
+        card_layout = QVBoxLayout(selection_card)
+        card_layout.setContentsMargins(24, 20, 24, 20)
+        card_layout.setSpacing(10)
 
-        selection_title = QLabel("🎯 Choose Chat Model")
-        selection_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #fbbf24;")
-        selection_layout.addWidget(selection_title)
-        selection_layout.addSpacing(8)
+        # Chat model dropdown
+        chat_label = QLabel("🎯 Chat Model (conversations)")
+        chat_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #fbbf24;")
+        card_layout.addWidget(chat_label)
 
-        # Model option buttons
-        self._model_buttons: Dict[str, QPushButton] = {}
-        self._selected_model: str = DEFAULT_CHAT_MODEL
+        self._chat_combo = QComboBox()
+        self._chat_combo.setMinimumHeight(36)
+        self._chat_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for mid in self._ALL_MODELS:
+            info = self._ALL_MODELS[mid]
+            self._chat_combo.addItem(f"{info['name']}  •  VRAM: {info['vram']}", mid)
+        self._chat_combo.setCurrentIndex(self._chat_combo.findData(self._chat_model))
+        self._chat_combo.currentIndexChanged.connect(self._on_chat_combo_changed)
+        card_layout.addWidget(self._chat_combo)
 
-        for model_id, info in self.MODEL_OPTIONS.items():
-            btn = QPushButton()
-            btn.setCheckable(True)
-            btn.setMinimumHeight(72)
-            btn.setMaximumHeight(72)
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            btn.setText(f"{info['name']}  •  VRAM: {info['vram']}\n{info['description']}")
-            btn.setStyleSheet("""
-                QPushButton {
-                    text-align: left;
-                    padding: 12px 16px;
-                    border: 2px solid #27272a;
-                    border-radius: 8px;
-                    background: #1a1d26;
-                    color: #e4e4e7;
-                    font-size: 13px;
-                    line-height: 1.4;
-                }
-                QPushButton:hover {
-                    border-color: #f59e0b;
-                    background: #1e222c;
-                }
-                QPushButton:checked {
-                    border-color: #f59e0b;
-                    background: rgba(245, 158, 11, 0.1);
-                }
-            """)
-            btn.clicked.connect(lambda checked, m=model_id: self._on_model_selected(m))
-            self._model_buttons[model_id] = btn
-            selection_layout.addWidget(btn)
+        card_layout.addSpacing(8)
 
-        # VRAM note — explains that VRAM values include the always-loaded intent judge
-        ram_note = QLabel(
-            "ℹ️ VRAM values include the intent judge model (gemma4:e2b) "
-            "which is always loaded for voice intent classification."
-        )
-        ram_note.setWordWrap(True)
-        ram_note.setStyleSheet("font-size: 11px; color: #71717a; padding: 0px 4px;")
-        selection_layout.addWidget(ram_note)
+        # Fast model dropdown
+        fast_label = QLabel("⚡ Fast Model (voice intent, tool routing)")
+        fast_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #a78bfa;")
+        card_layout.addWidget(fast_label)
+
+        self._fast_combo = QComboBox()
+        self._fast_combo.setMinimumHeight(36)
+        self._fast_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for mid in self._FAST_MODEL_IDS:
+            info = self._ALL_MODELS[mid]
+            self._fast_combo.addItem(f"{info['name']}  •  VRAM: {info['vram']}", mid)
+        self._fast_combo.setCurrentIndex(self._fast_combo.findData(self._fast_model))
+        self._fast_combo.currentIndexChanged.connect(self._on_fast_combo_changed)
+        card_layout.addWidget(self._fast_combo)
 
         layout.addWidget(selection_card)
 
-        # Model list card
+        # VRAM bar
+        self._detected_vram_mb = detect_total_vram_mb()
+        self._vram_bar = QFrame()
+        self._vram_bar.setObjectName("card")
+        self._vram_bar.setStyleSheet("QFrame#card { padding: 12px 20px; }")
+        vl = QVBoxLayout(self._vram_bar)
+        vl.setContentsMargins(24, 16, 24, 16)
+        vl.setSpacing(4)
+        self._vram_label = QLabel("")
+        self._vram_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e4e4e7;")
+        vl.addWidget(self._vram_label)
+        self._vram_detail = QLabel("")
+        self._vram_detail.setWordWrap(True)
+        self._vram_detail.setStyleSheet("font-size: 12px; color: #71717a;")
+        vl.addWidget(self._vram_detail)
+        layout.addWidget(self._vram_bar)
+
+        # Required models card
         card = QFrame()
         card.setObjectName("card")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(24, 24, 24, 24)
-        card_layout.setSpacing(12)
-
-        models_title = QLabel("📦 Required Models")
-        models_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #fbbf24;")
-        card_layout.addWidget(models_title)
-        card_layout.addSpacing(8)
-
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(24, 24, 24, 24)
+        cl.setSpacing(12)
+        mt = QLabel("📦 Required Models")
+        mt.setStyleSheet("font-size: 16px; font-weight: bold; color: #fbbf24;")
+        cl.addWidget(mt)
+        cl.addSpacing(8)
         self.models_label = QLabel("Loading...")
         self.models_label.setWordWrap(True)
         self.models_label.setStyleSheet("line-height: 1.6;")
-        card_layout.addWidget(self.models_label)
-
+        cl.addWidget(self.models_label)
         layout.addWidget(card)
 
-        # Progress
+        # Progress + log
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
-
-        # Log output
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setVisible(False)
@@ -1266,272 +2029,338 @@ class ModelsPage(QWizardPage):
         layout.addWidget(self.log_output)
 
         # Buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
-
+        bl = QHBoxLayout()
+        bl.setSpacing(12)
         self.install_btn = QPushButton("📥 Install Missing Models")
         self.install_btn.clicked.connect(self._install_models)
-        btn_layout.addWidget(self.install_btn)
-
+        bl.addWidget(self.install_btn)
         self.skip_btn = QPushButton("⏭️ Skip")
         self.skip_btn.setObjectName("secondary")
         self.skip_btn.clicked.connect(self._skip_models)
-        btn_layout.addWidget(self.skip_btn)
+        bl.addWidget(self.skip_btn)
+        bl.addStretch()
+        layout.addLayout(bl)
 
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        # Status label
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
-
         layout.addStretch()
-
         self.setLayout(layout)
 
         self._is_complete = False
-        self._missing_models: List[str] = []
+        self._missing_models = []
         self._current_model_index = 0
-        self._worker: Optional[CommandWorker] = None
+        self._worker = None
 
-    def _set_wizard_height(self, height: int) -> None:
-        """Resize the parent wizard to the given height, updating the minimum too."""
-        wizard = self.wizard()
-        if wizard:
-            wizard.setMinimumHeight(height)
-            wizard.resize(wizard.width(), height)
-
-    def _on_model_selected(self, model_id: str):
-        """Handle model selection."""
-        self._selected_model = model_id
-
-        # Update button checked states
-        for m_id, btn in self._model_buttons.items():
-            btn.setChecked(m_id == model_id)
-
-        # Update the models list display
+        if self._detected_vram_mb is not None:
+            # Account for companion-model overhead so the recommendation
+            # leaves room for embeddings + whisper alongside the chat model.
+            overhead = self._EMBED_VRAM_MB + self._whisper_vram_mb()
+            usable_mb = self._detected_vram_mb - overhead
+            rec = get_recommended_model_id(usable_mb if usable_mb > 0 else None)
+            if rec in self._ALL_MODELS:
+                self._chat_model = rec
+                # Fast model stays gemma4:e2b unless VRAM constrains it
+                cv = required_vram_mb(rec) or 0
+                fv = required_vram_mb(self._fast_model) or 0
+                if cv + fv + overhead > self._detected_vram_mb:
+                    for c in self._FAST_MODEL_IDS:
+                        rc = required_vram_mb(c) or 0
+                        if rc <= cv and cv + rc + overhead <= self._detected_vram_mb:
+                            self._fast_model = c
+                            break
+                self._sync_combo_states()
+        self._refresh_vram_display()
         self._update_models_display()
 
-    def _update_models_display(self):
-        """Update the models display based on selected model."""
-        wizard = self.wizard()
+    def _build_linked_view(self):
+        """No-op — kept for backward compat. Selection uses dropdowns."""
+        pass
 
-        # Get config values
-        embed_model = "nomic-embed-text"
-        intent_judge_model = "gemma4:e2b"
+    def _build_unlinked_view(self):
+        """No-op — kept for backward compat. Selection uses dropdowns."""
+        pass
+
+    def _make_button(self, info, compact=False):
+        """No-op — kept for backward compat. Selection uses dropdowns."""
+        pass
+
+    def _on_link_toggled(self, linked):
+        self._linked = linked
+        if linked:
+            self._fast_model = self._chat_model
+        self._sync_combo_states()
+        self._refresh_vram_display()
+        self._update_models_display()
+
+    def _on_linked_selected(self, mid):
+        """No-op — selection uses dropdowns."""
+        pass
+
+    def _on_fast_combo_changed(self, idx):
+        """Handle fast model combo change."""
+        mid = self._fast_combo.itemData(idx)
+        if mid:
+            self._fast_model = mid
+            if self._linked:
+                self._chat_model = mid
+                self._chat_combo.setCurrentIndex(self._chat_combo.findData(mid))
+            self._refresh_vram_display()
+            self._update_models_display()
+
+    def _on_chat_combo_changed(self, idx):
+        """Handle chat model combo change with auto-downgrade for fast model."""
+        mid = self._chat_combo.itemData(idx)
+        if not mid:
+            return
+        self._chat_model = mid
+        if self._linked:
+            self._fast_model = mid
+            self._fast_combo.setCurrentIndex(self._fast_combo.findData(mid))
+        else:
+            # Auto-downgrade: if fast model needs more VRAM than chat model,
+            # or the total (chat + fast + embed + whisper) exceeds our GPU,
+            # pick the smallest fast-suitable model that fits.
+            overhead = self._EMBED_VRAM_MB + self._whisper_vram_mb()
+            cv = required_vram_mb(mid) or 0
+            fv = required_vram_mb(self._fast_model) or 0
+            exceeds_vram = (
+                self._detected_vram_mb is not None
+                and cv + fv + overhead > self._detected_vram_mb
+            )
+            if fv > cv or exceeds_vram:
+                for c in self._FAST_MODEL_IDS:
+                    rc = required_vram_mb(c) or 0
+                    fits_vram = (
+                        self._detected_vram_mb is None
+                        or cv + rc + overhead <= self._detected_vram_mb
+                    )
+                    if rc <= cv and fits_vram:
+                        self._fast_model = c
+                        self._fast_combo.setCurrentIndex(self._fast_combo.findData(c))
+                        break
+        self._refresh_vram_display()
+        self._update_models_display()
+
+    def _sync_combo_states(self):
+        """Sync combo selections to reflect current model choices."""
+        ci = self._chat_combo.findData(self._chat_model)
+        if ci >= 0:
+            self._chat_combo.setCurrentIndex(ci)
+        fi = self._fast_combo.findData(self._fast_model)
+        if fi >= 0:
+            self._fast_combo.setCurrentIndex(fi)
+        self._refresh_vram_display()
+        self._update_models_display()
+
+    def _refresh_vram_display(self):
+        overhead = self._EMBED_VRAM_MB + self._whisper_vram_mb()
+        fv = required_vram_mb(self._fast_model) or 0
+        cv = required_vram_mb(self._chat_model) or 0
+        if self._linked or self._fast_model == self._chat_model:
+            total = cv + overhead
+            detail = f"(chat {cv // 1024} GB + embed+whisper {overhead // 1024} GB — shared VRAM)"
+        else:
+            total = fv + cv + overhead
+            detail = (f"(fast {fv // 1024} GB + chat {cv // 1024} GB "
+                      f"+ embed+whisper {overhead // 1024} GB)")
+        tg = total / 1024
+        if self._detected_vram_mb is not None:
+            dg = self._detected_vram_mb / 1024
+            self._vram_label.setText(
+                f"Total VRAM Required: {tg:.1f} GB    "
+                f"Your GPU: {dg:.1f} GB"
+            )
+            if total > self._detected_vram_mb:
+                sg = (total - self._detected_vram_mb) / 1024
+                self._vram_detail.setText(
+                    f"Your GPU has {dg:.1f} GB VRAM but the selected "
+                    f"models need {tg:.1f} GB ({sg:.1f} GB over). "
+                    "Switch to smaller models or use CPU fallback."
+                )
+                self._vram_detail.setStyleSheet(
+                    "font-size: 12px; color: #f87171; padding-top: 2px;"
+                )
+            else:
+                self._vram_detail.setText(detail)
+                self._vram_detail.setStyleSheet("font-size: 12px; color: #71717a; padding-top: 2px;")
+        else:
+            self._vram_label.setText(f"Total VRAM Required: {tg:.1f} GB")
+            self._vram_detail.setText(detail)
+
+    def _update_models_display(self):
+        wiz = self.wizard()
+        em = "nomic-embed-text"
         try:
-            cfg = load_settings()
-            embed_model = cfg.ollama_embed_model
-            intent_judge_model = getattr(cfg, "intent_judge_model", "gemma4:e2b")
+            em = load_settings().ollama_embed_model
         except Exception:
             pass
-
-        # Get installed models
-        installed: List[str] = []
-        if isinstance(wizard, SetupWizard) and wizard.ollama_status:
-            installed = wizard.ollama_status.installed_models
-
-        # Required models: selected chat model + embed model + intent judge model
-        # Intent judge (gemma4) is always required for voice intent classification
-        required = [self._selected_model, embed_model]
-        if intent_judge_model and intent_judge_model not in required:
-            required.append(intent_judge_model)
-
-        # Check which are missing
-        def normalize_model(name: str) -> str:
-            return name[:-len(":latest")] if name.endswith(":latest") else name
-
-        installed_normalized = {normalize_model(m) for m in installed}
-        self._missing_models = [
-            m for m in required
-            if normalize_model(m) not in installed_normalized and m not in installed
-        ]
-        required_installed = [
-            m for m in required
-            if normalize_model(m) in installed_normalized or m in installed
-        ]
-
-        # Update display
+        req = [self._chat_model]
+        if self._fast_model not in req:
+            req.append(self._fast_model)
+        if em not in req:
+            req.append(em)
+        installed = []
+        if isinstance(wiz, SetupWizard) and wiz.ollama_status:
+            installed = wiz.ollama_status.installed_models
+        def norm(n):
+            return n[:-(len(":latest"))] if n.endswith(":latest") else n
+        inorm = {norm(m) for m in installed}
+        self._missing_models = [m for m in req if norm(m) not in inorm and m not in installed]
+        rinst = [m for m in req if norm(m) in inorm or m in installed]
         if self._missing_models:
-            missing_text = ", ".join(f"❌ {m}" for m in self._missing_models)
-            installed_text = (
-                ", ".join(f"✅ {m}" for m in required_installed)
-                if required_installed else "None"
-            )
-            model_info = self.MODEL_OPTIONS.get(self._selected_model, {})
-            size_info = model_info.get("size", "unknown size")
             self.models_label.setText(
-                f"Installed: {installed_text}\n\n"
-                f"Missing: {missing_text}\n\n"
-                f"⚠️ Download size: {size_info}. Installation may take several minutes."
+                f"Missing: {', '.join('X ' + m for m in self._missing_models)}"
             )
             self._is_complete = False
             self.install_btn.setVisible(True)
             self.install_btn.setEnabled(True)
             self.skip_btn.setVisible(True)
-            # Grow to fit the install/skip row + three-line missing label when
-            # the user swaps to a model that still needs downloading.
             if not self.progress.isVisible():
                 self._set_wizard_height(self._WIZARD_HEIGHT_WITH_BUTTONS)
         else:
-            self.models_label.setText(f"✅ All required models are installed: {', '.join(required_installed)}")
+            self.models_label.setText(f"All required models are installed: {', '.join(rinst)}")
             self._is_complete = True
             self.install_btn.setVisible(False)
             self.skip_btn.setVisible(False)
             if not self.progress.isVisible():
                 self._set_wizard_height(self._WIZARD_HEIGHT_BASE)
-
         self.completeChanged.emit()
 
     def _save_model_to_config(self):
-        """Save the selected chat model to config file."""
         try:
-            config_path = default_config_path()
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if config_path.exists():
-                with config_path.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
-            else:
-                config = {}
-
-            config["ollama_chat_model"] = self._selected_model
-
-            with config_path.open("w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2)
-
-            return True
+            from jarvis.config import _load_json, _save_json
+            cp = default_config_path()
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            cfg = _load_json(cp) or {}
+            cfg["ollama_chat_model"] = self._chat_model
+            cfg["fast_model"] = self._fast_model
+            return _save_json(cp, cfg)
         except Exception:
             return False
 
     def initializePage(self):
-        """Initialize page with current model status."""
-        # Load the currently configured chat model
-        current_chat_model = DEFAULT_CHAT_MODEL
+        cc = DEFAULT_CHAT_MODEL
+        fc = "gemma4:e2b"
         try:
-            cfg = load_settings()
-            current_chat_model = cfg.ollama_chat_model
+            c = load_settings()
+            cc = c.ollama_chat_model
+            fc = getattr(c, "fast_model", "gemma4:e2b")
         except Exception:
             pass
-
-        # Pre-select the model if it's one of our options, otherwise default
-        if current_chat_model in self.MODEL_OPTIONS:
-            self._selected_model = current_chat_model
-        else:
-            self._selected_model = DEFAULT_CHAT_MODEL
-
-        # Update button states
-        for m_id, btn in self._model_buttons.items():
-            btn.setChecked(m_id == self._selected_model)
-
-        # Update the models display
+        self._chat_model = cc if cc in self._ALL_MODELS else DEFAULT_CHAT_MODEL
+        self._fast_model = fc if fc in self._ALL_MODELS else "gemma4:e2b"
+        overhead = self._EMBED_VRAM_MB + self._whisper_vram_mb()
+        cv = required_vram_mb(self._chat_model) or 0
+        fv = required_vram_mb(self._fast_model) or 0
+        exceeds_vram = (
+            self._detected_vram_mb is not None
+            and cv + fv + overhead > self._detected_vram_mb
+        )
+        if fv > cv or exceeds_vram:
+            for c in self._FAST_MODEL_IDS:
+                rc = required_vram_mb(c) or 0
+                fits_vram = (
+                    self._detected_vram_mb is None
+                    or cv + rc + overhead <= self._detected_vram_mb
+                )
+                if rc <= cv and fits_vram:
+                    self._fast_model = c
+                    break
+        # Default to unlinked — separate fast model is the recommended layout
+        # even when both happen to be the same model ID.
+        self._linked = False
+        self._link_cb.setChecked(False)
+        self._sync_combo_states()
+        self._refresh_vram_display()
         self._update_models_display()
+        # Force the wizard to recalculate its height for this page's content.
+        wiz = self.wizard()
+        if wiz:
+            QTimer.singleShot(0, wiz.adjustSize)
 
     def _install_models(self):
-        """Start installing missing models."""
-        # Save the selected model to config first
         if not self._save_model_to_config():
-            self.status_label.setText("⚠️ Could not save model selection to config. Continuing with installation...")
+            self.status_label.setText("Could not save model selection. Continuing...")
             self.status_label.setStyleSheet("color: #fbbf24;")
-
         if not self._missing_models:
             self._is_complete = True
             self.completeChanged.emit()
             return
-
         self._current_model_index = 0
         self._install_next_model()
 
     def _install_next_model(self):
-        """Install the next model in the queue."""
         if self._current_model_index >= len(self._missing_models):
-            # All models installed — tear down the install UI and recompute
-            # the display from the refreshed installed-models list so the
-            # label, install/skip visibility, completeness flag, and wizard
-            # height all snap to the "all installed" state in one place.
             self.progress.setVisible(False)
             self.log_output.setVisible(False)
             self.log_output.clear()
             self._update_models_display()
-            self.status_label.setText("✅ All models installed successfully!")
+            self.status_label.setText("All models installed!")
             self.status_label.setStyleSheet("color: #4ade80;")
             return
-
-        model = self._missing_models[self._current_model_index]
-
+        m = self._missing_models[self._current_model_index]
         self.install_btn.setEnabled(False)
         self.skip_btn.setEnabled(False)
         self.progress.setVisible(True)
-        self.progress.setRange(0, 0)  # Indeterminate
+        self.progress.setRange(0, 0)
         self.log_output.setVisible(True)
         self._set_wizard_height(self._WIZARD_HEIGHT_INSTALLING)
-
-        self.status_label.setText(f"📥 Installing {model}... ({self._current_model_index + 1}/{len(self._missing_models)})")
+        self.status_label.setText(f"Installing {m}... ({self._current_model_index + 1}/{len(self._missing_models)})")
         self.status_label.setStyleSheet("color: #a1a1aa;")
-
-        # Get ollama path
-        wizard = self.wizard()
-        ollama_path = "ollama"
-        if isinstance(wizard, SetupWizard) and wizard.ollama_status and wizard.ollama_status.cli_path:
-            ollama_path = wizard.ollama_status.cli_path
-
-        self._worker = CommandWorker([ollama_path, "pull", model])
+        op = "ollama"
+        w = self.wizard()
+        if isinstance(w, SetupWizard) and w.ollama_status and w.ollama_status.cli_path:
+            op = w.ollama_status.cli_path
+        self._worker = CommandWorker([op, "pull", m])
         self._worker.output.connect(self._on_install_output)
-        self._worker.finished.connect(self._on_install_finished)
+        self._worker.completed.connect(self._on_install_finished)
         self._worker.start()
 
-    def _on_install_output(self, text: str):
-        """Handle installation output."""
+    def _on_install_output(self, text):
         self.log_output.append(text)
-        # Auto-scroll to bottom
-        scrollbar = self.log_output.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
 
-    def _on_install_finished(self, success: bool, message: str):
-        """Handle installation completion."""
+    def _on_install_finished(self, success, message):
         if success:
-            # Track the just-installed model in the wizard's cached status
-            # so _update_models_display sees it on the next recompute.
-            model = self._missing_models[self._current_model_index]
-            wizard = self.wizard()
-            if isinstance(wizard, SetupWizard) and wizard.ollama_status:
-                if model not in wizard.ollama_status.installed_models:
-                    wizard.ollama_status.installed_models.append(model)
+            m = self._missing_models[self._current_model_index]
+            w = self.wizard()
+            if isinstance(w, SetupWizard) and w.ollama_status:
+                if m not in w.ollama_status.installed_models:
+                    w.ollama_status.installed_models.append(m)
             self._current_model_index += 1
             self._install_next_model()
         else:
             self.progress.setVisible(False)
-            self.status_label.setText(f"❌ Failed to install model. {message}")
+            self.status_label.setText(f"Failed to install model. {message}")
             self.status_label.setStyleSheet("color: #f87171;")
             self.install_btn.setEnabled(True)
             self.skip_btn.setEnabled(True)
 
     def _skip_models(self):
-        """Skip model installation."""
         self._is_complete = True
-        self.status_label.setText("⚠️ Skipped model installation. Jarvis may not work correctly without all models.")
+        self.status_label.setText("Skipped model installation. Jarvis may not work correctly.")
         self.status_label.setStyleSheet("color: #fbbf24;")
         self.completeChanged.emit()
 
-    def isComplete(self) -> bool:
-        """Page is complete when all models are installed or skipped."""
+    def isComplete(self):
         return self._is_complete
 
-    def validatePage(self) -> bool:
-        """Save model selection when leaving the page."""
+    def validatePage(self):
         self._save_model_to_config()
         return True
 
-    def nextId(self) -> int:
-        """Go to Whisper setup page next."""
-        wizard = self.wizard()
-        if isinstance(wizard, SetupWizard):
-            # Always show whisper setup page (for model selection on all platforms)
-            return wizard.mlx_whisper_page_id
+    def nextId(self):
+        w = self.wizard()
+        if isinstance(w, SetupWizard):
+            return w.dictation_page_id
         return super().nextId()
 
-
+    def _set_wizard_height(self, height):
+        w = self.wizard()
+        if w:
+            w.setMinimumHeight(height)
+            w.resize(w.width(), height)
 def _is_faster_whisper_turbo_supported() -> bool:
     """Check if the installed faster-whisper supports the large-v3-turbo model."""
     try:
@@ -1564,6 +2393,25 @@ class WhisperSetupPage(QWizardPage):
         ("small.en", "Small", "~465MB", "~2GB VRAM", "Good balance of speed and accuracy"),
         ("medium.en", "Medium", "~1.5GB", "~5GB VRAM", "Best balance (Recommended)"),
     ]
+
+    # VRAM in MB per whisper model ID (used by ModelsPage for total VRAM budget).
+    _WHISPER_VRAM_MAP: dict[str, int] = {
+        "tiny": 1024,
+        "base": 1024,
+        "small": 2048,
+        "medium": 5120,
+        "large-v3-turbo": 6144,
+    }
+
+    @staticmethod
+    def get_whisper_vram_mb(model_id: str) -> int:
+        """Return VRAM in MB for a given whisper model ID.
+
+        Strips the ``.en`` suffix for lookup so ``small.en`` maps to the same
+        VRAM as ``small``.  Returns 2048 (small default) for unknown IDs.
+        """
+        base = model_id.replace(".en", "")
+        return WhisperSetupPage._WHISPER_VRAM_MAP.get(base, 2048)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2008,21 +2856,15 @@ class WhisperSetupPage(QWizardPage):
     def _save_whisper_model_to_config(self):
         """Save the selected whisper model to config file."""
         try:
+            from jarvis.config import _load_json, _save_json
             config_path = default_config_path()
             config_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if config_path.exists():
-                with config_path.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
-            else:
-                config = {}
-
+            config = _load_json(config_path) or {}
             config["whisper_model"] = self._selected_whisper_model
 
-            with config_path.open("w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2)
-
-            return True
+            # _save_json keeps the file at 0o600 (it can hold llm_api_key).
+            return _save_json(config_path, config)
         except Exception:
             return False
 
@@ -2127,7 +2969,7 @@ class WhisperSetupPage(QWizardPage):
 
         self._worker = CommandWorker([brew_path, "install", "ffmpeg"])
         self._worker.output.connect(self._on_output)
-        self._worker.finished.connect(self._on_ffmpeg_installed)
+        self._worker.completed.connect(self._on_ffmpeg_installed)
         self._worker.start()
 
     def _install_mlx_whisper(self):
@@ -2143,7 +2985,7 @@ class WhisperSetupPage(QWizardPage):
         python_path = sys.executable
         self._worker = CommandWorker([python_path, "-m", "pip", "install", "mlx-whisper"])
         self._worker.output.connect(self._on_output)
-        self._worker.finished.connect(self._on_mlx_installed)
+        self._worker.completed.connect(self._on_mlx_installed)
         self._worker.start()
 
     def _on_output(self, text: str):
@@ -2186,10 +3028,11 @@ class WhisperSetupPage(QWizardPage):
         return True
 
     def nextId(self) -> int:
-        """Go to dictation setup next."""
+        """Go to Provider Choice so the user can confirm or change
+        their LLM runtime before continuing."""
         wizard = self.wizard()
         if isinstance(wizard, SetupWizard):
-            return wizard.dictation_page_id
+            return wizard.provider_choice_page_id
         return super().nextId()
 
 
@@ -2453,21 +3296,16 @@ class LocationPage(QWizardPage):
             return
 
         try:
-            import json
+            from jarvis.config import _load_json, _save_json
 
             config_path = default_config_path()
             config_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if config_path.exists():
-                with config_path.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
-            else:
-                config = {}
-
+            config = _load_json(config_path) or {}
             config["location_ip_address"] = self._validated_ip
 
-            with config_path.open("w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2)
+            # _save_json keeps the file at 0o600 (it can hold llm_api_key).
+            _save_json(config_path, config)
 
             self.save_status_label.setText(f"✅ Saved to {config_path}")
             self.save_status_label.setStyleSheet("color: #4ade80;")

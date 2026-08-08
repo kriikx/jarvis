@@ -373,6 +373,182 @@ class TestCheckForUpdates:
                             status = check_for_updates()
                             assert status.update_available is False
 
+    @pytest.mark.unit
+    def test_develop_channel_no_update_when_commit_matches(self):
+        """Develop channel must NOT show an update when the installed build
+        is from the same commit as the latest release — even on a fresh
+        install that never recorded a last-installed asset ID."""
+        installed_sha = "a" * 40
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "id": 12345,
+                "tag_name": "latest",
+                "name": "Latest Development Build",
+                "draft": False,
+                "prerelease": True,
+                "html_url": "https://github.com/isair/jarvis/releases/tag/latest",
+                "body": f"Dev release notes\n\n**Commit**: {installed_sha}",
+                "assets": [
+                    {
+                        "id": 200001,
+                        "name": "Jarvis-macOS-arm64.zip",
+                        "browser_download_url": "https://example.com/download",
+                        "size": 1000,
+                    }
+                ],
+            }
+        ]
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("desktop_app.updater.get_version", return_value=(f"dev-{installed_sha}", "develop")):
+            with patch("requests.get", return_value=mock_response):
+                with patch("sys.platform", "darwin"):
+                    with patch("platform.machine", return_value="arm64"):
+                        status = check_for_updates()
+                        assert status.update_available is False
+
+    @pytest.mark.unit
+    def test_develop_channel_shows_update_when_commit_differs(self):
+        """Develop channel must show an update when the latest release was
+        built from a different commit than the installed build."""
+        installed_sha = "a" * 40
+        release_sha = "b" * 40
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "id": 12345,
+                "tag_name": "latest",
+                "name": "Latest Development Build",
+                "draft": False,
+                "prerelease": True,
+                "html_url": "https://github.com/isair/jarvis/releases/tag/latest",
+                "body": f"Dev release notes\n\n**Commit**: {release_sha}",
+                "assets": [
+                    {
+                        "id": 200002,
+                        "name": "Jarvis-macOS-arm64.zip",
+                        "browser_download_url": "https://example.com/download",
+                        "size": 1000,
+                    }
+                ],
+            }
+        ]
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("desktop_app.updater.get_version", return_value=(f"dev-{installed_sha}", "develop")):
+            with patch("requests.get", return_value=mock_response):
+                with patch("sys.platform", "darwin"):
+                    with patch("platform.machine", return_value="arm64"):
+                        status = check_for_updates()
+                        assert status.update_available is True
+
+    @pytest.mark.unit
+    def test_develop_channel_no_update_when_short_commit_matches_release(self):
+        """A locally built develop bundle (dev-<7-hex> from
+        scripts/build_installer.*) must not show an update when its short
+        SHA prefixes the commit the latest release was built from."""
+        installed_sha = "abcdef1"  # 7 hex chars, as stamped by local builds
+        release_sha = installed_sha + ("2" * 33)  # 40 hex chars total
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "id": 12345,
+                "tag_name": "latest",
+                "name": "Latest Development Build",
+                "draft": False,
+                "prerelease": True,
+                "html_url": "https://github.com/isair/jarvis/releases/tag/latest",
+                "body": f"Dev release notes\n\n**Commit**: {release_sha}",
+                "assets": [
+                    {
+                        "id": 200003,
+                        "name": "Jarvis-macOS-arm64.zip",
+                        "browser_download_url": "https://example.com/download",
+                        "size": 1000,
+                    }
+                ],
+            }
+        ]
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("desktop_app.updater.get_version", return_value=(f"dev-{installed_sha}", "develop")):
+            with patch("requests.get", return_value=mock_response):
+                with patch("sys.platform", "darwin"):
+                    with patch("platform.machine", return_value="arm64"):
+                        status = check_for_updates()
+                        assert status.update_available is False
+
+    @pytest.mark.unit
+    def test_develop_channel_falls_back_to_asset_id_when_body_has_no_commit(self):
+        """When the release body carries no commit stamp, develop channel
+        falls back to asset-ID tracking."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "id": 12345,
+                "tag_name": "latest",
+                "name": "Latest Development Build",
+                "draft": False,
+                "prerelease": True,
+                "html_url": "https://github.com/isair/jarvis/releases/tag/latest",
+                "body": "Dev release notes",  # No **Commit** stamp
+                "assets": [
+                    {
+                        "id": 200004,
+                        "name": "Jarvis-macOS-arm64.zip",
+                        "browser_download_url": "https://example.com/download",
+                        "size": 1000,
+                    }
+                ],
+            }
+        ]
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("desktop_app.updater.get_version", return_value=("dev-" + ("a" * 40), "develop")):
+            with patch("desktop_app.updater.get_last_installed_asset_id", return_value=200004):  # Same ID
+                with patch("requests.get", return_value=mock_response):
+                    with patch("sys.platform", "darwin"):
+                        with patch("platform.machine", return_value="arm64"):
+                            status = check_for_updates()
+                            assert status.update_available is False
+
+    @pytest.mark.unit
+    def test_develop_channel_falls_back_when_installed_version_has_no_commit(self):
+        """When the installed version carries no commit hash (e.g. dev-local
+        from a source run), develop channel falls back to asset-ID tracking
+        and still flags the update when no install is recorded."""
+        release_sha = "b" * 40
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "id": 12345,
+                "tag_name": "latest",
+                "name": "Latest Development Build",
+                "draft": False,
+                "prerelease": True,
+                "html_url": "https://github.com/isair/jarvis/releases/tag/latest",
+                "body": f"Dev release notes\n\n**Commit**: {release_sha}",
+                "assets": [
+                    {
+                        "id": 200005,
+                        "name": "Jarvis-macOS-arm64.zip",
+                        "browser_download_url": "https://example.com/download",
+                        "size": 1000,
+                    }
+                ],
+            }
+        ]
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("desktop_app.updater.get_version", return_value=("dev-local", "develop")):
+            with patch("desktop_app.updater.get_last_installed_asset_id", return_value=None):
+                with patch("requests.get", return_value=mock_response):
+                    with patch("sys.platform", "darwin"):
+                        with patch("platform.machine", return_value="arm64"):
+                            status = check_for_updates()
+                            assert status.update_available is True
+
 
 class TestUpdateStatus:
     """Tests for UpdateStatus dataclass."""

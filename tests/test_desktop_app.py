@@ -46,6 +46,98 @@ class TestEntryPointImports:
         )
 
 
+class TestOllamaRuntimeFlags:
+    """The desktop startup must only launch/verify Ollama when a local
+    provider actually uses it. A pure OpenAI-compatible setup should skip
+    the Ollama server-start and model-verification entirely."""
+
+    def _flags(self, **provider):
+        from types import SimpleNamespace
+        from desktop_app.app import _ollama_runtime_flags
+        return _ollama_runtime_flags(SimpleNamespace(**provider))
+
+    def test_default_ollama_needs_everything(self):
+        needed, chat_on_ollama = self._flags(llm_provider="ollama", embedding_provider="")
+        assert needed is True
+        assert chat_on_ollama is True
+
+    def test_pure_openai_compatible_skips_ollama(self):
+        """Chat and embeddings both remote: no local server, no model checks."""
+        needed, chat_on_ollama = self._flags(
+            llm_provider="openai_compatible", embedding_provider="")
+        assert needed is False
+        assert chat_on_ollama is False
+
+    def test_openai_chat_with_ollama_embeddings_still_needs_server(self):
+        """Chat remote but embeddings on Ollama: the server must be up, but
+        the chat-model verification does not apply (the chat model isn't an
+        Ollama model)."""
+        needed, chat_on_ollama = self._flags(
+            llm_provider="openai_compatible", embedding_provider="ollama")
+        assert needed is True
+        assert chat_on_ollama is False
+
+    def test_ollama_chat_with_openai_embeddings_needs_server_and_chat_check(self):
+        needed, chat_on_ollama = self._flags(
+            llm_provider="ollama", embedding_provider="openai_compatible")
+        assert needed is True
+        assert chat_on_ollama is True
+
+    def test_missing_attrs_default_to_ollama(self):
+        """A cfg-like object without provider attrs defaults to the Ollama
+        path (fail-safe — never skip Ollama setup by accident)."""
+        from types import SimpleNamespace
+        from desktop_app.app import _ollama_runtime_flags
+        needed, chat_on_ollama = _ollama_runtime_flags(SimpleNamespace())
+        assert needed is True
+        assert chat_on_ollama is True
+
+
+class TestOpenAICompatStartupCheck:
+    """At startup Jarvis can't launch a third-party LLM server, so it must
+    check reachability and warn the user early rather than failing silently
+    on the first request."""
+
+    def test_reachable_when_models_listed(self):
+        from types import SimpleNamespace
+        from desktop_app.app import _check_openai_compat_reachable
+        cfg = SimpleNamespace(
+            llm_provider="openai_compatible", llm_base_url="http://x/v1",
+            llm_api_key="", llm_chat_model="m", embedding_provider="")
+
+        class _Backend:
+            def list_models(self, timeout_sec=4.0):
+                return ["m-chat"]
+
+        with patch("jarvis.llm.get_llm_backend", return_value=_Backend()):
+            assert _check_openai_compat_reachable(cfg) is True
+
+    def test_unreachable_when_listing_empty_or_raises(self):
+        from types import SimpleNamespace
+        from desktop_app.app import _check_openai_compat_reachable
+        cfg = SimpleNamespace(llm_provider="openai_compatible", llm_base_url="http://x/v1")
+
+        class _Empty:
+            def list_models(self, timeout_sec=4.0):
+                return []
+
+        with patch("jarvis.llm.get_llm_backend", return_value=_Empty()):
+            assert _check_openai_compat_reachable(cfg) is False
+
+        with patch("jarvis.llm.get_llm_backend", side_effect=RuntimeError("boom")):
+            assert _check_openai_compat_reachable(cfg) is False
+
+    def test_unreachable_message_names_url_not_key(self):
+        """The unreachable dialog message mentions the URL but never the API key."""
+        from types import SimpleNamespace
+        from desktop_app.app import _build_unreachable_message
+        cfg = SimpleNamespace(llm_base_url="http://localhost:1234/v1", llm_api_key="sk-secret")
+        msg = _build_unreachable_message(cfg)
+        assert "http://localhost:1234/v1" in msg
+        assert "sk-secret" not in msg
+        assert "Setup Wizard" in msg
+
+
 class TestGetCrashPaths:
     """Tests for get_crash_paths() function."""
 
@@ -1055,3 +1147,187 @@ class TestMemoryViewerModulePath:
         assert module_path == "desktop_app.memory_viewer", (
             f"Module path should be 'desktop_app.memory_viewer', found '{module_path}'"
         )
+
+
+class TestDaemonSmokeTest:
+    """Tests for the --smoke-test flag on the daemon entry point."""
+
+    def test_smoke_test_prints_marker_and_returns(self):
+        """daemon.main(smoke_test=True) prints SMOKE_TEST_INIT_OK and returns."""
+        from unittest.mock import patch, MagicMock
+        import io
+
+        # Mock all heavy dependencies so the smoke test path runs without
+        # needing a real database, Whisper model, TTS engine, etc.
+        with patch("jarvis.daemon.load_settings") as mock_load, \
+             patch("jarvis.daemon.Database") as mock_db, \
+             patch("jarvis.daemon.initialize_mcp_tools", return_value=({}, {})), \
+             patch("jarvis.daemon.DialogueMemory") as mock_dm, \
+             patch("jarvis.daemon.get_location_context", return_value="Location: Test"), \
+             patch("jarvis.daemon.create_tts_engine") as mock_tts, \
+             patch("jarvis.daemon.VoiceListener") as mock_vl, \
+             patch("jarvis.memory.graph.GraphMemoryStore") as mock_graph:
+
+            from tests.conftest import MockConfig
+            mock_load.return_value = MockConfig(db_path=":memory:")
+
+            mock_db_instance = MagicMock()
+            mock_db.return_value = mock_db_instance
+
+            mock_dm_instance = MagicMock()
+            mock_dm.return_value = mock_dm_instance
+
+            mock_tts_instance = MagicMock()
+            mock_tts_instance.enabled = False
+            mock_tts.return_value = mock_tts_instance
+
+            mock_vl_instance = MagicMock()
+            mock_vl.return_value = mock_vl_instance
+
+            mock_graph_instance = MagicMock()
+            mock_graph_instance.migrate_legacy_shape.return_value = False
+            mock_graph.return_value = mock_graph_instance
+
+            # Capture stdout
+            captured = io.StringIO()
+            with patch("sys.stdout", captured):
+                from jarvis.daemon import main
+                main(smoke_test=True)
+
+            output = captured.getvalue()
+            assert "SMOKE_TEST_INIT_OK" in output, (
+                f"Expected SMOKE_TEST_INIT_OK marker in output, got:\n{output}"
+            )
+            # Verify cleanup happened
+            mock_db_instance.close.assert_called_once()
+
+    def test_normal_mode_does_not_print_marker(self):
+        """daemon.main(smoke_test=False) does NOT print SMOKE_TEST_INIT_OK."""
+        # This test verifies the smoke test marker is exclusive to smoke_test mode.
+        # We mock enough to reach the branching point but the main loop would
+        # block forever, so we raise an exception right before it.
+        from unittest.mock import patch, MagicMock
+        import io
+
+        class StopBeforeMainLoop(Exception):
+            pass
+
+        with patch("jarvis.daemon.load_settings") as mock_load, \
+             patch("jarvis.daemon.Database") as mock_db, \
+             patch("jarvis.daemon.initialize_mcp_tools", return_value=({}, {})), \
+             patch("jarvis.daemon.DialogueMemory") as mock_dm, \
+             patch("jarvis.daemon.get_location_context", return_value="Location: Test"), \
+             patch("jarvis.daemon.create_tts_engine") as mock_tts, \
+             patch("jarvis.daemon.VoiceListener") as mock_vl, \
+             patch("jarvis.memory.graph.GraphMemoryStore") as mock_graph, \
+             patch("jarvis.daemon.time.sleep", side_effect=StopBeforeMainLoop()):
+
+            from tests.conftest import MockConfig
+            mock_load.return_value = MockConfig(db_path=":memory:")
+
+            mock_db_instance = MagicMock()
+            mock_db.return_value = mock_db_instance
+
+            mock_dm_instance = MagicMock()
+            mock_dm.return_value = mock_dm_instance
+
+            mock_tts_instance = MagicMock()
+            mock_tts_instance.enabled = False
+            mock_tts.return_value = mock_tts_instance
+
+            mock_vl_instance = MagicMock()
+            mock_vl.return_value = mock_vl_instance
+
+            mock_graph_instance = MagicMock()
+            mock_graph_instance.migrate_legacy_shape.return_value = False
+            mock_graph.return_value = mock_graph_instance
+
+            captured = io.StringIO()
+            with patch("sys.stdout", captured):
+                from jarvis.daemon import main
+                try:
+                    main(smoke_test=False)
+                except StopBeforeMainLoop:
+                    pass
+
+            output = captured.getvalue()
+            assert "SMOKE_TEST_INIT_OK" not in output, (
+                "SMOKE_TEST_INIT_OK should not appear in normal mode"
+            )
+            assert "✓ Daemon started" in output, (
+                f"Expected normal startup output, got:\n{output}"
+            )
+
+
+class TestDesktopSmokeTest:
+    """Tests for the --smoke-test flag on the desktop app entry point."""
+
+    def test_smoke_test_main_calls_daemon_with_smoke_flag(self):
+        """_smoke_test_main() calls daemon_main(smoke_test=True)."""
+        from unittest.mock import patch, MagicMock
+
+        mock_qapp = MagicMock()
+        mock_qapp.instance.return_value = mock_qapp
+
+        with patch("PyQt6.QtWidgets.QApplication", mock_qapp), \
+             patch("jarvis.daemon.main") as mock_daemon_main:
+
+            from desktop_app.app import _smoke_test_main
+            result = _smoke_test_main()
+
+            mock_daemon_main.assert_called_once_with(smoke_test=True)
+            assert result == 0
+
+    def test_smoke_test_main_prints_pass_on_success(self):
+        """_smoke_test_main() prints SMOKE_TEST_PASSED when daemon succeeds."""
+        from unittest.mock import patch, MagicMock
+        import io
+
+        mock_qapp = MagicMock()
+        mock_qapp.instance.return_value = mock_qapp
+
+        with patch("PyQt6.QtWidgets.QApplication", mock_qapp), \
+             patch("jarvis.daemon.main") as mock_daemon_main:
+
+            mock_daemon_main.return_value = None
+
+            captured = io.StringIO()
+            with patch("sys.stdout", captured):
+                from desktop_app.app import _smoke_test_main
+                result = _smoke_test_main()
+
+            output = captured.getvalue()
+            assert "SMOKE_TEST_PASSED" in output, (
+                f"Expected SMOKE_TEST_PASSED in output, got:\n{output}"
+            )
+            assert result == 0
+
+    def test_smoke_test_main_returns_1_on_daemon_failure(self):
+        """_smoke_test_main() returns 1 when daemon_main raises."""
+        from unittest.mock import patch, MagicMock
+
+        mock_qapp = MagicMock()
+        mock_qapp.instance.return_value = mock_qapp
+
+        with patch("PyQt6.QtWidgets.QApplication", mock_qapp), \
+             patch("jarvis.daemon.main", side_effect=RuntimeError("Simulated init failure")):
+
+            from desktop_app.app import _smoke_test_main
+            result = _smoke_test_main()
+
+            assert result == 1, f"Expected exit code 1 on failure, got {result}"
+
+    def test_main_routes_smoke_test_flag(self):
+        """main() detects --smoke-test and calls _smoke_test_main()."""
+        from unittest.mock import patch
+
+        # The smoke test flag detection is a simple string check in sys.argv.
+        # We test it by patching _smoke_test_main to verify it is called.
+        with patch("desktop_app.app.sys.argv", ["Jarvis.exe", "--smoke-test"]), \
+             patch("desktop_app.app._smoke_test_main", return_value=42) as mock_smoke:
+
+            from desktop_app.app import main
+            result = main()
+
+            mock_smoke.assert_called_once()
+            assert result == 42  # return value propagated from _smoke_test_main
